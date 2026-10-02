@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#0b1022" />
+    <meta name="description" content="STAK! — stack oddly shaped blocks as high as you can. A browser port of the Apple Vision Pro game." />
+    <title>STAK!</title>
+    <link rel="icon" type="image/png" href="./favicon.png" />
+    <link rel="apple-touch-icon" href="./images/apple-touch-icon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@500;600;700;800;900&display=swap" rel="stylesheet" />
+    <script type="module" crossorigin src="./assets/index-BmlNtdG4.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BubwmCKM.css">
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="scene" aria-label="STAK! play space"></canvas>
+      <div id="world-ui" aria-live="polite"></div>
+      <div id="hud"></div>
+      <div id="overlay"></div>
+      <div id="loading" class="loading">
+        <img class="loading-logo" src="./images/stak-logo.png" alt="STAK!" />
+        <div class="loading-bar"><div class="loading-fill"></div></div>
+        <p class="loading-label">Loading blocks…</p>
+      </div>
+    </div>
+  </body>
+</html>
