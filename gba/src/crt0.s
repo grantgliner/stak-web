@@ -1,12 +1,12 @@
 @ STAK! GBA startup code. Header fields are fixed up by tools/gbafix.py
-@ (or devkitPro's gbafix, which also inserts the boot logo for real hardware).
+@ (boot logo, fixed byte, checksum), or devkitPro's gbafix.
     .section .crt0, "ax"
     .global _start
     .arm
     .align 2
 _start:
     b       start_vector
-    .fill   156, 1, 0           @ boot logo (filled by gbafix)
+    .fill   156, 1, 0           @ boot logo (filled in by gbafix)
     .ascii  "STAK GBA\0\0\0\0"  @ title (12)
     .ascii  "ASTE"              @ game code
     .ascii  "GG"                @ maker code
