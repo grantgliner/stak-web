@@ -1,0 +1,10 @@
+audio build/shots/title.wav
+wait 120
+shot build/shots/title.ppm
+wait 1200
+tap START
+wait 30
+shot build/shots/select.ppm
+tap RIGHT
+wait 20
+shot build/shots/select2.ppm

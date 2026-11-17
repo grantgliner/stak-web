@@ -1,0 +1,24 @@
+# Twin Turbo smoke test: boots straight into the run stage (title/select stubbed or skipped with START/A)
+audio build/shots/run.wav
+wait 30
+tap START
+wait 20
+tap A
+wait 20
+tap A
+wait 90
+shot build/shots/run_start.ppm
+hold RIGHT
+wait 120
+shot build/shots/run_1.ppm
+tap A 12
+wait 10
+shot build/shots/run_jump.ppm
+wait 200
+shot build/shots/run_2.ppm
+tap B
+wait 4
+shot build/shots/run_slide.ppm
+wait 400
+shot build/shots/run_3.ppm
+wait 600

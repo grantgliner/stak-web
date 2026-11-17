@@ -1,0 +1,6 @@
+build/
+*.gba
+*.elf
+*.sav
+__pycache__/
+tools/harness/harness
