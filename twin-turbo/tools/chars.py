@@ -43,7 +43,8 @@ FRANCO = [
     "..oHoslohssSSssSsssso",
     "..oHoSsoBbsssssSsssso",
     "...oHooBbbbsssSllSSo.",
-    ".....oSBbbbboBBBBBo..",
+    ".....oSBbbbbbbBBBBo..",
+    "......oBbbbboBBBBBo..",
     "......oBbbbbbotttto..",
     "......oBbbbbbbolloo..",
     "......ooBbbbbbbbbo...",
@@ -76,7 +77,7 @@ TRIPLESET = [
     "....ocCCCCCoooooo....",
     "....ocCCCCCCo........",
 ]
-HEAD_NECK = {'franco': (10, 21), 'tripleset': (10, 21)}   # template pixel on the neck top
+HEAD_NECK = {'franco': (10, 22), 'tripleset': (10, 21)}   # template pixel on the neck top
 
 
 def hexc(h):
@@ -279,13 +280,13 @@ def static_pose(kind):
         return dict(hip=(15.5, 32.0), neck=(16.5, 23.0 + b), feet=[((19.0, 43.5), 0.0), ((12.5, 43.5), 0.0)],
                     hands=[(19.5, 32.0 + b), (13.0, 32.0 + b)], head=(0, 0), kbend=1, elbow=-1)
     if kind == 'jump':                         # take-off: near knee drives up, far leg trails the push
-        return dict(hip=(15.0, 30.0), neck=(16.5, 21.0), feet=[((19.0, 36.5), -0.2), ((11.5, 41.5), 0.6)],
+        return dict(hip=(15.0, 30.5), neck=(16.5, 22.0), feet=[((19.0, 36.5), -0.2), ((11.5, 41.5), 0.6)],
                     hands=[(10.5, 26.5), (21.5, 26.0)], head=(0, 0), kbend=1, elbow=-1)
     if kind == 'apex':                         # top of the arc: knees tucked, arms out for balance
         return dict(hip=(15.0, 30.5), neck=(16.5, 21.5), feet=[((18.5, 37.5), 0.0), ((13.0, 38.5), 0.3)],
                     hands=[(22.0, 27.0), (9.5, 27.5)], head=(0, 0), kbend=1, elbow=-1)
     if kind == 'fall':                         # dropping: legs reach for the ground, arms lift
-        return dict(hip=(15.0, 30.0), neck=(16.5, 21.0), feet=[((18.5, 42.0), -0.1), ((12.5, 40.5), 0.3)],
+        return dict(hip=(15.0, 30.5), neck=(16.5, 22.0), feet=[((18.5, 42.0), -0.1), ((12.5, 40.5), 0.3)],
                     hands=[(22.5, 25.0), (9.0, 24.5)], head=(0, 0), kbend=1, elbow=-1)
     if kind == 'land':                         # squash on touchdown
         return dict(hip=(15.0, 34.5), neck=(17.0, 25.5), feet=[((19.5, 43.5), 0.0), ((11.5, 43.5), 0.0)],
