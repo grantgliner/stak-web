@@ -1,0 +1,8 @@
+audio build/shots/run.wav
+wait 30
+tap START
+wait 20
+tap A
+wait 20
+tap A
+wait 3000

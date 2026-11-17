@@ -1,0 +1,26 @@
+# Drive stage: skip the run with L+R on the select screen, then race
+audio build/shots/drive.wav
+wait 60
+tap START
+wait 30
+wait 20
+hold L+R
+tap A
+hold -
+wait 60
+shot build/shots/drive_grid.ppm
+wait 150
+hold A
+wait 90
+shot build/shots/drive_go.ppm
+wait 60
+hold A+LEFT
+wait 20
+shot build/shots/drive_turn.ppm
+hold A
+wait 60
+tap R
+wait 20
+shot build/shots/drive_boost.ppm
+wait 200
+shot build/shots/drive_3.ppm
