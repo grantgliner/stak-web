@@ -11,10 +11,10 @@ T, OUT, SKIN, SKIN_D, HAIR, HAIR_D, HAIR_L, SHIRT, SHIRT_D, SHIRT_L, ACC, PANTS,
 
 LOOKS = {
     'franco': dict(pal=['#000000', '#1a1026', '#f4b88e', '#c47c5a', '#3a2418', '#1e120c', '#6a4630',
-                        '#2f8ae0', '#1c55a4', '#8ccaff', '#0c1838', '#8cb4e4', '#5a7cb4', '#f6f6f8', '#9aa0b8', '#ffd24a'],
+                        '#2f8ae0', '#1c55a4', '#8ccaff', '#0c1838', '#8cb4e4', '#5a7cb4', '#f6f6f8', '#9aa0b8', '#7a3826'],
                    pattern='diamonds'),
     'tripleset': dict(pal=['#000000', '#1a1026', '#f6c4a0', '#cc8a68', '#a86c3c', '#6e4222', '#d89c5c',
-                           '#8a2436', '#561426', '#c04a58', '#f08a2c', '#2e2c38', '#18161e', '#f6f6f8', '#9aa0b8', '#ff5a8a'],
+                           '#8a2436', '#561426', '#c04a58', '#f08a2c', '#2e2c38', '#18161e', '#f6f6f8', '#9aa0b8', '#94503a'],
                       pattern='stripes'),
 }
 
@@ -22,56 +22,56 @@ LOOKS = {
 # o outline  h hair  H hair dark  g hair light  s skin  S skin shade
 # w eye white  e pupil  b beard  m mouth  t teeth/white
 HEAD_MAP = {'o': OUT, 'h': HAIR, 'H': HAIR_D, 'g': HAIR_L, 's': SKIN, 'S': SKIN_D,
-            'w': SHOE, 'e': OUT, 'b': HAIR_D, 'm': SKIN_D, 't': SHOE}
+            'w': SHOE, 'e': OUT, 'b': HAIR, 'm': SKIN_D, 't': SHOE, 'l': EXTRA}
 
 FRANCO = [
-    "..........oooo.......",
-    ".......ooogghhoo.....",
-    ".....oogghhhhhhhoo...",
-    "...ooghhhhhhhhhhhho..",
-    ".oohhhhhhhhhhhhhhhho.",
-    "oHHhhhhhhhhhhhhhhhho.",
-    ".ooHHhhhhhhhhhhhhhho.",
-    "..oHHhhhhhhhhhhhhhho.",
-    ".oHHHhhhhhhhhhhhhsso.",
-    "oHHHHhhhhhsooosssooo.",
-    ".oHHHhhhssowwwosSweo.",
-    "..oHHhosSsoweeossooo.",
-    "..oHHhosSsoweeoSsssso",
-    "..oHHhoSsssooosSsssso",
-    "...oHHhossssssSSsSSo.",
-    "...oHHbbsssssbbbbbo..",
-    "....oHbbbsssbmtttbo..",
-    ".....oHbbbbbbbmmbbo..",
-    "......obbbbbbbbbbbo..",
-    ".......oobbbbbbbbbo..",
-    ".........ooooooooo...",
+    ".......ooooo.........",
+    ".....oohhgghhoo......",
+    "...oohhhhhgggghoo....",
+    "..ohhhhhhhhhggggho...",
+    "oohhhhhhhhhhhhhhhho..",
+    ".oHhhhhhhhhhhhhhhhho.",
+    "ooHHhhhhhhhhhhhhhhho.",
+    ".oHHHhhhhhhsssssssso.",
+    "oHHHhhhhhhsHHHHsHHso.",
+    ".oHHhhhhhhsooosSooso.",
+    "..oHhhhossowwwoSwesso",
+    "..oHhhhoSsoweeoSoosso",
+    "..oHhhhoSsoweeoSSssso",
+    "..oHhhhosssooosSsssSo",
+    "...oHHHbsssssssSlllo.",
+    "...oHHbbbssssbbbbbbo.",
+    "....oHbbbbbbbltttbo..",
+    "....oHHbbbbbbblllbo..",
+    ".....oHbbbbbbbbbbbo..",
+    "......oHbbbbbbbbbo...",
+    ".......obbbbbbbbo....",
+    "........oooooooo.....",
 ]
 
 TRIPLESET = [
-    ".......oo.ooo........",
-    ".....oogoogghoo......",
-    "...oogghhgghhhhoo....",
-    "..oghhHhhhhHhhhhho...",
-    ".oghhHhgghHhggghhho..",
-    "ohhhHhghhHhghhhghhho.",
-    "ohhHhghhHhghhhHhgghho",
-    "ohHhhhhhhhhhhhHhghhgo",
-    "ohHhhhhhhhhhhhhsshhho",
-    ".oHhhhhhhhsooosssooo.",
-    "..oHhhhhssowwwosoweo.",
-    "..oHhhosSsoweeoSoeeo.",
-    "..oHhhosSsoweeoSsooo.",
-    "..oHhhoSsssooosSSsso.",
-    "...oHhhossssssssssso.",
-    "....ooooSsssssssssso.",
-    "........oSssssssmmso.",
-    ".........oSsssssssso.",
-    "..........oSSsssssso.",
-    "...........ooSSSssso.",
-    ".............oooooo..",
+    ".....ooo.oooo........",
+    "...oohhgohhggoo......",
+    "..ohhhggghhhhgghoo...",
+    ".ohHhhhhhgghhhhhggho.",
+    "ohHhhgghhhhHhggghhho.",
+    "oHhhhhhggghhHhhhgggo.",
+    "oHHhhhhhhhggghhHhhho.",
+    "oHHHhhhhhhhhhhhhhhso.",
+    ".oHhhhhhHssHHHHsHHso.",
+    ".oHhhhhhhhsooosSooso.",
+    "..oHhhhossowwwoSweso.",
+    "..oHhhhoSsoweeoSoosso",
+    "..oHhhhoSsoweeoSssslo",
+    "..oHhhhosssooosSssso.",
+    "...oHhossssssssSsso..",
+    "....ooSssssssslllso..",
+    "......oSssssssssso...",
+    ".......oSssssssso....",
+    "........oSSsssSo.....",
+    ".........oooooo......",
 ]
-HEAD_NECK = (11, 20)    # template pixel that sits on the neck top
+HEAD_NECK = {'franco': (11, 21), 'tripleset': (11, 19)}   # template pixel on the neck top
 
 
 def hexc(h):
@@ -272,7 +272,7 @@ def static_pose(kind):
                     hands=[(27.0, 29.0), (5.0, 27.0)], head=(0, 0), kbend=1)
     if kind == 'slide':
         return dict(hip=(12.0, 40.0), neck=(10.5, 31.5), feet=[((27.0, 43.5), -0.1), ((24.0, 43.0), -0.1)],
-                    hands=[(5.0, 41.5), (16.0, 37.0)], head=(-6, 9), kbend=-1)
+                    hands=[(5.0, 41.5), (16.0, 37.0)], head=(-4, 9), kbend=-1)
     raise KeyError(kind)
 
 
@@ -308,8 +308,8 @@ def compose(who, frame):
     shoe(cv, nfoot, nang, False)
     # head
     tpl = FRANCO if who == 'franco' else TRIPLESET
-    hx = int(round(neck[0])) - HEAD_NECK[0] + P['head'][0]
-    hy = int(round(neck[1])) - HEAD_NECK[1] + P['head'][1]
+    hx = int(round(neck[0])) - HEAD_NECK[who][0] + P['head'][0]
+    hy = int(round(neck[1])) - HEAD_NECK[who][1] + P['head'][1]
     if P.get('face') == 'hurt':
         tpl = hurt_face(tpl)
     cv.template(tpl, hx, hy, HEAD_MAP)
@@ -330,7 +330,7 @@ def hurt_face(tpl):
         out.append(r.replace('w', 's').replace('e', 's'))
     out = [list(r) for r in out]
     # draw >< style squint at the near eye (cols 12-15, rows 10-12)
-    for (x, y) in ((12, 10), (13, 11), (14, 11), (12, 12)):
+    for (x, y) in ((11, 10), (12, 11), (13, 11), (11, 12)):
         out[y][x] = 'o'
     return [''.join(r) for r in out]
 
