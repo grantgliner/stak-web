@@ -348,6 +348,7 @@ static void draw_world(void) {
     ObjAttr* o = oam_alloc();
     int pal = hcolliding ? OBJPAL_RED : tray[cursor].color;
     put_affine(o, sx_of(hx), sy_of(hy), OBJ_TILE_PIECE(tray[cursor].shape), pal, MTX_HELD, 1, 1);
+    if (hangle == 0) { o->attr0 &= ~ATTR0_AFF; o->attr1 &= ~0x3E00; }   /* upright: plain sprite, cheaper per scanline */
   }
   /* tray */
   for (int k = 0; k < 3; k++) {
@@ -364,6 +365,19 @@ static void draw_world(void) {
     int sx = sx_of(b->p.x), sy = sy_of(b->p.y);
     if (sx < -40 || sx > 280 || sy < -40 || sy > 200) continue;
     ObjAttr* o = oam_alloc(); if (!o) break;
+    /* The GBA draws only ~1210 cycles of sprites per scanline: a 64x64 affine
+     * sprite costs 138, a plain one 64. Upright or upside-down blocks (most of a
+     * settled tower) use plain sprites, with flips for 180 degrees, so a busy row
+     * doesn't run out and drop the last sprites. */
+    int q = ((int)(((s64)b->a * 10430) >> 16) >> 7) & 511;
+    if (q == 0 || q == 256) {
+      int x = sx - 32, y = sy - 32;
+      if (x <= -64 || x >= 240 || y <= -64 || y >= 160) { o->attr0 = ATTR0_HIDE; continue; }
+      o->attr0 = ATTR0_Y(y) | ATTR0_SQUARE;
+      o->attr1 = ATTR1_X(x) | ATTR1_SIZE_64 | (q ? ATTR1_HFLIP | ATTR1_VFLIP : 0);
+      o->attr2 = ATTR2_TILE(OBJ_TILE_PIECE(b->shape)) | ATTR2_PRIO(2) | ATTR2_PAL(b->color);
+      continue;
+    }
     put_affine(o, sx, sy, OBJ_TILE_PIECE(b->shape), b->color, mtx_for_angle(b->c, b->s, b->a), 2, 0);
   }
   /* base slab */
@@ -419,6 +433,9 @@ int main(void) {
   int sky = 1024 - 161;
   for (;;) {
     video_vsync(sky);
+#ifdef PROFILE
+    u16 f_start = REG_TM2CNT_L;
+#endif
     snd_tick();
     read_keys();
     frame++;
@@ -451,5 +468,10 @@ int main(void) {
         pause_update();
         break;
     }
+#ifdef PROFILE   /* a frame has 4389 64-cycle ticks; log the ones that come close */
+    { u16 ft = (u16)(REG_TM2CNT_L - f_start); extern u32 phys_prof[8];
+      if (ft > 3000) dbg_printf("slow f%lu ticks=%u bodies=%d awake=%d pts=%d phys=%u narrow=%u solve=%u", frame, ft, phys_count, phys_awake, phys_points,
+                                (u16)(phys_prof[6] - phys_prof[0]), (u16)(phys_prof[3] - phys_prof[2]), (u16)(phys_prof[5] - phys_prof[4])); }
+#endif
   }
 }

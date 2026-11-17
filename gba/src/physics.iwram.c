@@ -78,6 +78,7 @@ static SPoint pts[MAX_PTS];
 static int npts;
 
 static u8 uf_parent[MAX_BODIES];
+static u8 tip_woke[MAX_BODIES] EWRAM_BSS, tip_ok[MAX_BODIES] EWRAM_BSS;   /* see tip_note_sleep */
 
 /* ---- math ------------------------------------------------------------ */
 fx fx_sin(fx a) {
@@ -88,9 +89,18 @@ fx fx_sin(fx a) {
 }
 fx fx_cos(fx a) { return fx_sin(a + FX_PI / 2); }
 
+/* unsigned divide in ARM code from IWRAM: libgcc's runs as Thumb from ROM and
+   costs several times more */
+static u32 udiv32(u32 n, u32 d) {
+  u32 q = 0, bit = 1;
+  while (d < n && !(d & 0x80000000u)) { d <<= 1; bit <<= 1; }
+  do { if (n >= d) { n -= d; q |= bit; } d >>= 1; bit >>= 1; } while (bit);
+  return q;
+}
+
 static inline u32 recip(fx k) {        /* 1/k in Q16, k > 0 (Q16) */
   if (k <= 2) return 0x7FFFFFFF;
-  return 0xFFFFFFFFu / (u32)k;
+  return udiv32(0xFFFFFFFFu, (u32)k);
 }
 
 /* ---- geometry -------------------------------------------------------- */
@@ -120,7 +130,7 @@ static void transform_parts(int shape, fx px, fx py, fx c, fx s, Poly* out, V2* 
   bmin->x = minx; bmin->y = miny; bmax->x = maxx; bmax->y = maxy;
 }
 
-int phys_piece_world(int shape, fx x, fx y, fx angle, Poly* polys) {
+ROM_CODE int phys_piece_world(int shape, fx x, fx y, fx angle, Poly* polys) {
   V2 a, b;
   transform_parts(shape, x, y, fx_cos(angle), fx_sin(angle), polys, &a, &b);
   return piece_defs[shape].nparts;
@@ -161,7 +171,7 @@ static int clip(V2* vin, u8* fin, V2* vout, u8* fout, V2 n, fx off, u8 clipEdge)
     s32 num = d0, den = d0 - d1;
     if (den < 0) { num = -num; den = -den; }
     while (den > 0x7FFF) { den >>= 1; num >>= 1; }
-    fx t = den ? (num << 16) / den : 0;
+    fx t = !den ? 0 : num < 0 ? -(fx)udiv32((u32)(-num) << 16, den) : (fx)udiv32((u32)num << 16, den);
     vout[k].x = vin[0].x + fxmul(t, vin[1].x - vin[0].x);
     vout[k].y = vin[0].y + fxmul(t, vin[1].y - vin[0].y);
     fout[k++] = clipEdge | 0x80;
@@ -216,6 +226,17 @@ static int collide(const Poly* A, const Poly* B, Manifold* m) {
   return k;
 }
 
+/* the bodies live in EWRAM (slow 16-bit bus); the SAT reads every vertex
+   several times, so work on IWRAM (stack) copies */
+static int collide_fast(const Poly* A, const Poly* B, Manifold* m) {
+  Poly a, b;
+  int na = A->n, nb = B->n;
+  a.n = na; b.n = nb;
+  for (int i = 0; i < na; i++) { a.v[i] = A->v[i]; a.nrm[i] = A->nrm[i]; }
+  for (int i = 0; i < nb; i++) { b.v[i] = B->v[i]; b.nrm[i] = B->nrm[i]; }
+  return collide(&a, &b, m);
+}
+
 static inline int aabb_overlap(V2 amin, V2 amax, V2 bmin, V2 bmax, fx m) {
   return !(amax.x + m < bmin.x || bmax.x + m < amin.x || amax.y + m < bmin.y || bmax.y + m < amin.y);
 }
@@ -234,7 +255,7 @@ static int alloc_body(void) {
   return -1;
 }
 
-int phys_add_static_box(fx cx, fx cy, fx hw, fx hh) {
+ROM_CODE int phys_add_static_box(fx cx, fx cy, fx hw, fx hh) {
   int i = alloc_body(); if (i < 0) return -1;
   Body* b = &phys_bodies[i];
   b->flags = BODY_USED | BODY_STATIC; b->shape = 0xFF; b->nparts = 1;
@@ -249,12 +270,13 @@ int phys_add_static_box(fx cx, fx cy, fx hw, fx hh) {
   return i;
 }
 
-int phys_add_piece(int shape, int color, fx x, fx y, fx angle) {
+ROM_CODE int phys_add_piece(int shape, int color, fx x, fx y, fx angle) {
   int i = alloc_body(); if (i < 0) return -1;
   Body* b = &phys_bodies[i];
   const PieceDef* d = &piece_defs[shape];
   b->flags = BODY_USED; b->shape = shape; b->color = color; b->nparts = d->nparts;
   b->p.x = x; b->p.y = y; b->a = angle; b->sleepTime = 0; b->frx = b->fry = b->fra = 0;
+  tip_woke[i] = tip_ok[i] = 0;
   update_body(b);
   BodyVel* v = &phys_vel[i];
   v->vx = v->vy = v->w = 0;
@@ -316,6 +338,11 @@ static void uf_union(int a, int b) { a = uf_find(a); b = uf_find(b); if (a != b)
 
 static inline int is_awake_dyn(const Body* b) { return (b->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == BODY_USED; }
 
+static inline fx inv_scale(fx x, u32 r, int rs) {
+  s64 v = (s64)x * r;
+  return (fx)(rs >= 0 ? v >> rs : v << -rs);
+}
+
 static void add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbiter* na, Arbiter* old) {
   int ni = na - arb_buf[arb_cur];
   Body* A = &phys_bodies[ai]; Body* B = &phys_bodies[bi];
@@ -365,20 +392,33 @@ static void add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbite
     if (det > 0 && (s64)k11 * k11 < det * 500) {
       s0->blk = 1;
       s0->k11 = k11; s0->k12 = k12; s0->k22 = k22;
-      s0->i11 = (fx)(((s64)k22 << 32) / det);
-      s0->i12 = (fx)(-(((s64)k12 << 32) / det));
-      s0->i22 = (fx)(((s64)k11 << 32) / det);
+      /* inverse of K = adj(K) / det. One 32-bit reciprocal of the normalised det
+         (17 significant bits) instead of three 64-bit divisions, which libgcc
+         does in slow Thumb code from ROM */
+      int sh = 0; u64 d = (u64)det;
+      while (d >= (1ull << 31)) { d >>= 1; sh++; }
+      while (d < (1u << 30)) { d <<= 1; sh--; }
+      u32 r = udiv32(0xFFFFFFFFu, (u32)(d >> 15));        /* ~ 2^47 / d */
+      int rs = 15 + sh;                              /* x * 2^32 / det = x * r >> rs */
+      s0->i11 = inv_scale(k22, r, rs);
+      s0->i12 = -inv_scale(k12, r, rs);
+      s0->i22 = inv_scale(k11, r, rs);
     }
   }
 }
 
 static inline void apply(SPoint* s, BodyVel* va, BodyVel* vb, fx dP, fx dx, fx dy, fx ka, fx kb) {
+  /* zero impulse (a clamped or idle contact) or a body acting as ground
+     (inverse mass 0, so ka/kb are 0 too) changes nothing: skip the multiplies */
+  if (!dP) return;
   if (s->ima) {
     fx p = fxmul(dP, s->ima);
     va->vx -= fxmul(p, dx); va->vy -= fxmul(p, dy); va->w -= fxmul(dP, ka);
   }
-  fx p = fxmul(dP, s->imb);
-  vb->vx += fxmul(p, dx); vb->vy += fxmul(p, dy); vb->w += fxmul(dP, kb);
+  if (s->imb) {
+    fx p = fxmul(dP, s->imb);
+    vb->vx += fxmul(p, dx); vb->vy += fxmul(p, dy); vb->w += fxmul(dP, kb);
+  }
 }
 
 static void warm_start(void) {
@@ -493,11 +533,30 @@ static void wake_body(int i) {
    asleep (i.e. a new block has settled). For every block: does the combined centre
    of mass of the block and everything stacked on it lie over the span of its
    support contacts? If not, wake it; the bodies above follow via the wake rule. */
+/* A body the balance test woke that then fell asleep again without moving is
+   held up by something the test can't see (a block leaning on a neighbour, or
+   wedged by its sides). Remember where it rested and leave it alone while it
+   stays there: otherwise it, and everything stacked on it, wakes and re-settles
+   every half second for the rest of the game, which is what made busy towers
+   slow. */
+static fx tip_x[MAX_BODIES] EWRAM_BSS, tip_y[MAX_BODIES] EWRAM_BSS, tip_a[MAX_BODIES] EWRAM_BSS;
+#define TIP_STILL_POS FX(0.05)
+#define TIP_STILL_ANG FX(0.02)
+static int tip_moved(int i) {
+  const Body* b = &phys_bodies[i];
+  fx dx = b->p.x - tip_x[i], dy = b->p.y - tip_y[i], da = b->a - tip_a[i];
+  return dx > TIP_STILL_POS || dx < -TIP_STILL_POS || dy > TIP_STILL_POS || dy < -TIP_STILL_POS || da > TIP_STILL_ANG || da < -TIP_STILL_ANG;
+}
+static void tip_note_sleep(int i) {
+  if (tip_woke[i]) { tip_woke[i] = 0; tip_ok[i] = !tip_moved(i); }
+  else if (tip_ok[i] && tip_moved(i)) tip_ok[i] = 0;
+}
+
 static u8 tip_above_n[MAX_BODIES] EWRAM_BSS, tip_above[MAX_BODIES][8] EWRAM_BSS;
 static fx tip_smin[MAX_BODIES] EWRAM_BSS, tip_smax[MAX_BODIES] EWRAM_BSS;
 static u8 tip_sup[MAX_BODIES] EWRAM_BSS, tip_mark[MAX_BODIES] EWRAM_BSS, tip_stack[MAX_BODIES] EWRAM_BSS;
-/* rare (once per settle): lives in ROM to save IWRAM */
-ROM_CODE static void tip_check(const Arbiter* arbs, int narb) {
+/* runs once per settle; in IWRAM so a block landing does not cost a frame */
+static void tip_check(const Arbiter* arbs, int narb) {
   fx* smin = tip_smin; fx* smax = tip_smax; u8* hasSup = tip_sup; u8* mark = tip_mark; u8* stack = tip_stack;
   for (int i = 0; i < phys_count; i++) { hasSup[i] = 0; tip_above_n[i] = 0; smin[i] = 0x7FFFFFFF; smax[i] = -0x7FFFFFFF; }
   sep_margin = MARGIN;
@@ -534,7 +593,10 @@ ROM_CODE static void tip_check(const Arbiter* arbs, int narb) {
       for (int q = 0; q < tip_above_n[c]; q++) { int u = tip_above[c][q]; if (!mark[u]) { mark[u] = 1; stack[sp++] = u; } }
     }
     fx comx = (fx)(mx / mt);
-    if (comx < smin[i] - TIP_MARGIN || comx > smax[i] + TIP_MARGIN) wake_body(i);
+    if ((comx < smin[i] - TIP_MARGIN || comx > smax[i] + TIP_MARGIN) && !tip_ok[i]) {
+      wake_body(i);
+      tip_woke[i] = 1; tip_x[i] = b->p.x; tip_y[i] = b->p.y; tip_a[i] = b->a;
+    }
   }
 }
 
@@ -584,7 +646,7 @@ void phys_step(void) {
       for (int pa = 0; pa < A->nparts; pa++) for (int pb = 0; pb < B->nparts; pb++) {
         if (!aabb_overlap(A->wp[pa].bmin, A->wp[pa].bmax, B->wp[pb].bmin, B->wp[pb].bmax, mg)) continue;
         Manifold m;
-        if (!collide(&A->wp[pa], &B->wp[pb], &m)) continue;
+        if (!collide_fast(&A->wp[pa], &B->wp[pb], &m)) continue;
         if (nout >= MAX_ARB) continue;
         Arbiter* na = &out[nout++];
         na->a = i; na->b = j; na->pa = pa; na->pb = pb;
@@ -684,6 +746,7 @@ void phys_step(void) {
     if (!is_awake_dyn(b) || woke[i]) continue;
     if (island_min[uf_find(i)] >= SLEEP_TIME) {
       b->flags |= BODY_SLEEP; phys_vel[i].vx = phys_vel[i].vy = phys_vel[i].w = 0;
+      tip_note_sleep(i);
       update_body(b);
       slept = 1;
     }

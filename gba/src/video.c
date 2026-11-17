@@ -2,7 +2,7 @@
 #include "gen/gfx_gen.h"
 #include "gen/pieces_gen.h"
 
-ObjAttr oam_shadow[128];
+ObjAttr oam_shadow[128] EWRAM_BSS __attribute__((aligned(4)));   /* EWRAM: IWRAM is kept for the physics */
 u16 txt_map[32 * 32] EWRAM_BSS;
 int txt_dirty;
 static int oam_next;
