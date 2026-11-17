@@ -14,7 +14,7 @@ LOOKS = {
     'franco': dict(pal=['#000000', '#1a1026', '#f4b88e', '#c47c5a', '#3a2418', '#1e120c', '#6a4630',
                         '#2f8ae0', '#1c55a4', '#8ccaff', '#0c1838', '#8cb4e4', '#5a7cb4', '#f6f6f8', '#9aa0b8', '#7a3826'],
                    pattern='diamonds'),
-    'tripleset': dict(pal=['#000000', '#1a1026', '#f6c4a0', '#cc8a68', '#a86c3c', '#6e4222', '#d89c5c',
+    'tripleset': dict(pal=['#000000', '#1a1026', '#f6c4a0', '#cc8a68', '#7c4a2a', '#4a2a18', '#a8703e',
                            '#8a2436', '#561426', '#c04a58', '#f08a2c', '#2e2c38', '#18161e', '#f6f6f8', '#9aa0b8', '#94503a'],
                       pattern='stripes'),
 }
@@ -37,17 +37,17 @@ FRANCO = [
     "oHHHhhHhhHSsssssso...",
     ".oHHHHhHhshhhHsshhso.",
     ".oHHHooHhsowwessweso.",
-    "..oHosSohsswwesSsesso",
-    "..oHoslohssssssSsssso",
+    "..oHosSohssSwesSsesso",
+    "..oHoslohssSSssSsssso",
     "..oHoSsoBbsssssSsssso",
     "...oHooBbbbsssSllSSo.",
-    "....oSSBbbbbbbBBBBo..",
-    "....oSSBbbbbbblloBo..",
-    "....oSSBbbbbbbbbbbo..",
-    "....oSSoBbbbbbbbbo...",
-    "....oSSSoBbbbbbbo....",
-    "....oSSSSoBbbbbo.....",
-    "....oSSSSSooooo......",
+    ".....oSBbbbboBBBBBo..",
+    "......oBbbbbbotttto..",
+    "......oBbbbbbbolloo..",
+    "......ooBbbbbbbbbo...",
+    "......oloBbbbbbbo....",
+    "......oSloBbbbbo.....",
+    "......oSSSooooo......",
 ]
 
 TRIPLESET = [
@@ -66,13 +66,13 @@ TRIPLESET = [
     "..oHoslohSsssssSssso.",
     "..oHoSsoSSssssssSsso.",
     "...oHooSSSssssSllSo..",
-    "....oSoSSSsssssssso..",
-    "....oSSoSSsssslllso..",
-    "....oSSoSSSsssSSsso..",
-    "....oSSSoSSsssssso...",
-    "....oSSSSooSSSSSo....",
-    "....oSSSSSSoooooo....",
-    "....oSSSSSSSo........",
+    ".....oSSSSsssssssso..",
+    "......oSSSsssslllso..",
+    "......oSoSSsssSSsso..",
+    "......oSloSsssssso...",
+    "......oSSloSSSSSo....",
+    "......oSSSloooooo....",
+    "......oSSSSo.........",
 ]
 HEAD_NECK = {'franco': (10, 21), 'tripleset': (10, 21)}   # template pixel on the neck top
 
@@ -338,7 +338,7 @@ def compose(who, frame):
 
 def hurt_face(tpl):
     """squeezed-shut eyes: near eye becomes a > squint, far eye a short line"""
-    out = [list(r.replace('w', 's').replace('e', 's')) for r in tpl]
+    out = [list(r.replace('w', 's').replace('e', 's').replace('t', 'o')) for r in tpl]
     for (x, y) in ((10, 10), (11, 10), (12, 11), (13, 11), (16, 11), (17, 11)):
         out[y][x] = 'o'
     return [''.join(r) for r in out]
