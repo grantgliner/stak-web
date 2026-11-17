@@ -64,7 +64,8 @@ zero_words:
     bx      lr
     .pool
 
-@ Minimal IRQ handler: acknowledge and tell the BIOS (for VBlankIntrWait).
+@ Minimal IRQ handler: acknowledge, tell the BIOS (for VBlankIntrWait), and on
+@ VBlank run vblank_isr (video.c).
     .section .iwram, "ax", %progbits
     .arm
     .align 2
@@ -78,7 +79,11 @@ isr_master:
     ldrh    r2, [r0, #-8]           @ BIOS IF at 0x03007FF8 (mirror 0x03FFFFF8)
     orr     r2, r2, r1
     strh    r2, [r0, #-8]
-    bx      lr
+    tst     r1, #1                  @ VBlank: re-arm the sky gradient DMA
+    bxeq    lr
+    ldr     r0, =vblank_isr
+    bx      r0                      @ tail call; returns to the BIOS through lr
+    .pool
 
     .section .rodata
     .align 2

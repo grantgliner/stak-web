@@ -46,16 +46,26 @@ void video_init(void) {
   REG_IME = 1;
 }
 
-void video_vsync(int sky_offset) {
-  VBlankIntrWait();
-  /* backdrop gradient via HBlank DMA */
+/* The sky gradient's HBlank DMA is re-armed from the VBlank interrupt, not the
+ * main loop: when a busy physics frame runs long (a tower falling), the main loop
+ * misses a VBlank and a DMA left running would paint the next frame from the
+ * wrong part of the gradient, which flashes. */
+static volatile int sky_off = 1024 - 161;
+
+void vblank_isr(void) {
+  int o = sky_off;
   REG_DMA0CNT = 0;
-  if (sky_offset < 0) sky_offset = 0;
-  if (sky_offset > 1024 - 161) sky_offset = 1024 - 161;
-  PAL_BG[0] = sky_ram[sky_offset];
-  REG_DMA0SAD = (u32)&sky_ram[sky_offset + 1];
+  PAL_BG[0] = sky_ram[o];
+  REG_DMA0SAD = (u32)&sky_ram[o + 1];
   REG_DMA0DAD = (u32)PAL_BG;
   REG_DMA0CNT = DMA_ENABLE | DMA_HBLANK | DMA_REPEAT | DMA_DST_FIXED | 1;
+}
+
+void video_vsync(int sky_offset) {
+  if (sky_offset < 0) sky_offset = 0;
+  if (sky_offset > 1024 - 161) sky_offset = 1024 - 161;
+  sky_off = sky_offset;
+  VBlankIntrWait();
   dma3_copy32((void*)MEM_OAM, oam_shadow, sizeof(oam_shadow) / 4);
   if (txt_dirty) { dma3_copy32(SCREENBLOCK(SBB_TEXT), txt_map, sizeof(txt_map) / 4); txt_dirty = 0; }
 }

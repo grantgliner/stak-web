@@ -61,7 +61,7 @@ static fx hx, hy, hangle, hangle_from, hangle_to;
 static int hrot_t, hcolliding, move_frames, hold_spawn_t;
 static int blocks, score, new_best;
 static fx cam_y, cam_target;
-static int over_t, pause_sel;
+static int over_t, over_shown, pause_sel;
 static int pop_t, pop_val; static fx pop_x, pop_y;
 static int last_placed = -1;
 
@@ -228,7 +228,7 @@ void play_enter(void) {
 
 static void game_over(void) {
   dbg_printf("GAME OVER blocks=%d", blocks);
-  state = ST_OVER; over_t = 0; holding = 0;
+  state = ST_OVER; over_t = 0; over_shown = 0; holding = 0;
   if (blocks > save.best_blocks) { save.best_blocks = blocks; new_best = 1; }
   if ((u32)score > save.best_score) save.best_score = score;
   save_write();
@@ -309,6 +309,12 @@ static void check_fall(void) {
 }
 
 static void update_camera(void) {
+  if (state == ST_OVER) {           /* pan down to the base to watch the tower land */
+    cam_target = 0;
+    cam_y += (cam_target - cam_y) / 12;
+    if (cam_y < FX(0.05)) cam_y = 0;
+    return;
+  }
   fx top = tower_top();
   fx focus = top + FX(4.5);
   if (holding && hy + FX(3.0) > focus) focus = hy + FX(3.0);
@@ -373,7 +379,9 @@ static void draw_world(void) {
 
 static void over_update(void) {
   over_t++;
-  if (over_t == 50) {
+  /* show the results once the camera has reached the base and the pieces had a moment to land */
+  if (!over_shown && ((over_t >= 60 && cam_y == 0) || over_t >= 240)) {
+    over_shown = 1;
     txt_panel(8, 4, 21, 12, PAL_PANEL);
     txt_center(5, 8, 21, "GAME OVER", PAL_TXT_YELLOW | TXT_ON_PANEL);
     char b[24] = "BLOCKS  "; fmt_int(b + 8, blocks); txt_center(7, 8, 21, b, PAL_TXT_WHITE | TXT_ON_PANEL);
@@ -382,7 +390,7 @@ static void over_update(void) {
     if (new_best) txt_center(12, 8, 21, "NEW BEST!", PAL_TXT_YELLOW | TXT_ON_PANEL);
     txt_center(14, 8, 21, "A RETRY   B TITLE", PAL_TXT_WHITE | TXT_ON_PANEL);
   }
-  if (over_t > 50) {
+  if (over_shown && over_t > 70) {
     if (keys_down & KEY_A) { snd_sfx(SFX_SELECT); play_enter(); }
     else if (keys_down & (KEY_B | KEY_START)) { snd_sfx(SFX_PUTBACK); title_enter(); }
   }

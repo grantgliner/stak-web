@@ -22,7 +22,7 @@ You need an `arm-none-eabi` GCC toolchain. devkitARM works, and so does Ubuntu's
 make            # builds stak.gba
 ```
 
-The generated assets in `src/gen/` are committed, so Python is only needed if you change the art or music. To regenerate them, run `make assets`. This needs Python 3 with numpy and Pillow, plus ffmpeg for the music.
+The generated assets in `src/gen/` are committed, so Python is only needed if you change the art or music. To regenerate them, run `make assets`. This needs Python 3 with numpy, Pillow and pretty_midi.
 
 ### Real hardware
 
@@ -45,7 +45,10 @@ The generated assets in `src/gen/` are committed, so Python is only needed if yo
   - game over when a block falls below the base or more than 0.45 m to either side,
   - the same game-over messages.
 - **Sound** is PSG only. Music uses channels 2, 3 and 4 plus a harmony line on channel 1. Sound effects take over channel 1.
-  - The menu and classic tunes are an automatic, rough transcription of `audio/menu.m4a` and `audio/classic.m4a`, made by `tools/gen_music.py`. That script runs pitch salience on a beat grid, then loops 32 bars of each song.
+  - The menu and classic tunes come from `audio/menu.m4a` and `audio/classic.m4a` in two steps:
+    1. `tools/stems_to_midi.py` splits each song into stems with Demucs and converts the bass, guitar and synth stems to notes with Spotify's basic-pitch. Drum hits come from onsets in the drum stem. Everything snaps to the song's 16th-note grid and is cut down to one note at a time per part. The result is `music/menu.mid` and `music/classic.mid`, with lead, harmony, bass and drum tracks. This step needs demucs, torch, basic-pitch and librosa, and only has to run again if the songs change.
+    2. `tools/gen_music.py` (part of `make assets`) turns those MIDI files into note data. The whole song loops.
+  - You can edit the MIDI files by hand in any DAW and run `make assets` again.
 - **Saves:** the best score goes to SRAM.
 
 ## Testing
