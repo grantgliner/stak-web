@@ -1,0 +1,8 @@
+build/
+build_bench/
+*.gba
+*.elf
+tools/harness/harness
+__pycache__/
+tools/hostsim/sim
+tools/hostsim/seq
