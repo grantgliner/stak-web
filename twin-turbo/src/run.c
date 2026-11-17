@@ -44,7 +44,7 @@
 enum { CAR_BOLT, CAR_ORCA, CAR_WASP, CAR_MANTA };
 enum { AN_RUN, AN_IDLE, AN_JUMP, AN_FALL, AN_HURT, AN_SLIDE, AN_CHEER };
 
-typedef struct { s32 x, y; s32 vx, vy; int on_ground, slide, inv, anim_t, frame, hurt, jump_held; } Player;
+typedef struct { s32 x, y; s32 vx, vy; int on_ground, slide, inv, anim_t, frame, hurt, jump_held, land; } Player;
 typedef struct { int active, type, warn; s32 x, y, vx; int y0, phase, bonked; s32 vy; } Car;
 typedef struct { s32 x, y, vx, vy; int t, active; } Loose;
 typedef struct { s16 x, y; u8 frame; } Hist;
@@ -140,7 +140,7 @@ static void setup_video(void) {
 static void reset_at(int cp) {
   checkpoint = cp;
   pl.x = (lvl_check[cp] + 40) << 8; pl.y = GROUND_Y << 8;
-  pl.vx = 0; pl.vy = 0; pl.on_ground = 1; pl.slide = 0; pl.inv = 90; pl.hurt = 0; pl.jump_held = 0;
+  pl.vx = 0; pl.vy = 0; pl.on_ground = 1; pl.slide = 0; pl.inv = 90; pl.hurt = 0; pl.jump_held = 0; pl.land = 0;
   for (int i = 0; i < 6; i++) cars[i].active = 0;
   for (int i = 0; i < 8; i++) loose[i].active = 0;
   next_car = 0;
@@ -222,18 +222,24 @@ static void update_player(void) {
   s32 feet = pl.y >> 8;
   if (!pl.on_ground && pl.vy >= 0) {
     int g = ground_at(pl.x >> 8, feet_prev, feet);
-    if (feet >= g) { pl.y = g << 8; pl.vy = 0; pl.on_ground = 1; sfx(SFX_LAND); spawn_fx(0, pl.x >> 8, g); }
+    if (feet >= g) { pl.y = g << 8; pl.vy = 0; pl.on_ground = 1; pl.land = 5; sfx(SFX_LAND); spawn_fx(0, pl.x >> 8, g); }
   } else if (pl.on_ground) {
     int f = pl.y >> 8;
     if (f < GROUND_Y && !on_pad(pl.x >> 8, f)) { pl.on_ground = 0; pl.vy = 0; }
   }
   /* animation */
   int sp = pl.vx < 0 ? -pl.vx : pl.vx;
+  if (pl.land) pl.land--;
   if (pl.hurt) pl.frame = CF_HURT;
-  else if (!pl.on_ground) pl.frame = pl.vy < 0 ? CF_JUMP : CF_FALL;
+  else if (!pl.on_ground) pl.frame = pl.vy < -350 ? CF_JUMP : pl.vy < 350 ? CF_APEX : CF_FALL;
   else if (pl.slide) pl.frame = CF_SLIDE;
+  else if (pl.land) { pl.frame = CF_LAND; pl.anim_t = 2 << 9; }   /* squash, then pick up the stride at push-off */
   else if (sp < 40) { pl.frame = (frame_count >> 5) & 1 ? CF_IDLE1 : CF_IDLE0; pl.anim_t = 0; }
-  else { pl.anim_t += 64 + sp / 3; pl.frame = CF_RUN0 + ((pl.anim_t >> 9) % 6); }
+  else {
+    /* 8-frame cycle; cadence rises with speed to about 3.3 strides a second at top speed */
+    pl.anim_t += 40 + sp / 5;
+    pl.frame = CF_RUN0 + ((pl.anim_t >> 9) & 7);
+  }
 }
 
 static void player_box(int* x0, int* y0, int* x1, int* y1) {
@@ -428,7 +434,7 @@ static void finale(void) {
       int ta = t, tb = t - 12;
       if (ta >= 0 && ta <= 32) { s32 k = ta * 256 / 32; pl.x = ax + (seat_a - ax) * k / 256; pl.y = ay + (seat_y - ay) * k / 256 - (lu_sin(ta * 4) * 40 * 256 / 4096); pf = CF_JUMP; }
       if (ta > 32) { pl.x = seat_a; pl.y = seat_y; pf = CF_CHEER0; }
-      if (tb < 0) { qf = CF_RUN0 + ((t >> 2) % 6); bx += 600; if (bx > seat_b - (40 << 8)) bx = seat_b - (40 << 8); }
+      if (tb < 0) { qf = CF_RUN0 + ((t * 3 >> 3) & 7); bx += 600; if (bx > seat_b - (40 << 8)) bx = seat_b - (40 << 8); }
       else if (tb <= 32) { s32 k = tb * 256 / 32; s32 sx0 = seat_b - (40 << 8); bx = sx0 + (seat_b - sx0) * k / 256; by = (GROUND_Y << 8) + (seat_y - (GROUND_Y << 8)) * k / 256 - (lu_sin(tb * 4) * 40 * 256 / 4096); qf = CF_JUMP; }
       else { bx = seat_b; by = seat_y; qf = CF_CHEER0; }
       if (t == 20 || t == 32) sfx(SFX_DOOR);
@@ -497,7 +503,7 @@ int run_stage(void) {
     update_orbs();
     /* partner replays your path 16 frames late */
     hist[hist_pos & 63].x = (pl.x >> 8) - 12; hist[hist_pos & 63].y = pl.y >> 8; hist[hist_pos & 63].frame = pl.frame;
-    if (pl.hurt) { hist[hist_pos & 63].frame = CF_RUN0 + ((frame_count >> 2) % 6); hist[hist_pos & 63].y = GROUND_Y; }
+    if (pl.hurt) { hist[hist_pos & 63].frame = CF_RUN0 + ((frame_count * 3 >> 3) & 7); hist[hist_pos & 63].y = GROUND_Y; }
     hist_pos++;
     Hist* h = &hist[(hist_pos - 10) & 63];
     /* camera */

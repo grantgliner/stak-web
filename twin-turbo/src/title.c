@@ -93,8 +93,8 @@ int select_screen(void) {
   for (int t = 0;; t++) {
     if (keys_hit & (KEY_LEFT | KEY_RIGHT)) { sel ^= 1; sfx(SFX_SELECT); }
     if (keys_hit & KEY_B) { REG_BLDCNT = 0; return 1; }
-    set_char(T_A, WHO_FRANCO, sel == WHO_FRANCO ? CF_RUN0 + ((t >> 3) % 6) : CF_IDLE0);
-    set_char(T_B, WHO_TRIPLESET, sel == WHO_TRIPLESET ? CF_RUN0 + ((t >> 3) % 6) : CF_IDLE0);
+    set_char(T_A, WHO_FRANCO, sel == WHO_FRANCO ? CF_RUN0 + ((t * 3 >> 3) & 7) : CF_IDLE0);
+    set_char(T_B, WHO_TRIPLESET, sel == WHO_TRIPLESET ? CF_RUN0 + ((t * 3 >> 3) & 7) : CF_IDLE0);
     oam_begin();
     obj_text(48, 16, "CHOOSE YOUR RUNNER", T_FONT, P_HUD);
     obj_text(28, 128, "THAT FRANCO", T_FONT, P_HUD);

@@ -15,15 +15,17 @@ LOOKS = {
                         '#2f8ae0', '#1c55a4', '#8ccaff', '#0c1838', '#8cb4e4', '#5a7cb4', '#f6f6f8', '#9aa0b8', '#7a3826'],
                    pattern='diamonds'),
     'tripleset': dict(pal=['#000000', '#1a1026', '#f6c4a0', '#cc8a68', '#7c4a2a', '#4a2a18', '#a8703e',
-                           '#8a2436', '#561426', '#c04a58', '#f08a2c', '#2e2c38', '#18161e', '#f6f6f8', '#9aa0b8', '#94503a'],
+                           '#8a2436', '#561426', '#c04a58', '#f08a2c', '#4a4860', '#2c2a3a', '#f6f6f8', '#9aa0b8', '#94503a'],
                       pattern='stripes'),
 }
 
 # ---------------------------------------------------------------- heads (facing right)
 # o outline  h hair  H hair dark  g hair light  s skin  S skin shade
 # w eye white  e pupil  B/b beard  m mouth  t teeth/white  l dark skin line (nostril, lips, ear)
+# C/c shirt collar (drawn over the neck)
 HEAD_MAP = {'o': OUT, 'h': HAIR, 'H': HAIR_D, 'g': HAIR_L, 's': SKIN, 'S': SKIN_D,
-            'w': SHOE, 'e': OUT, 'b': HAIR_L, 'B': HAIR, 'm': SKIN_D, 't': SHOE, 'l': EXTRA}
+            'w': SHOE, 'e': OUT, 'b': HAIR_L, 'B': HAIR, 'm': SKIN_D, 't': SHOE, 'l': EXTRA,
+            'C': SHIRT, 'c': SHIRT_D}
 
 FRANCO = [
     "............oooo.....",
@@ -46,8 +48,8 @@ FRANCO = [
     "......oBbbbbbbolloo..",
     "......ooBbbbbbbbbo...",
     "......oloBbbbbbbo....",
-    "......oSloBbbbbo.....",
-    "......oSSSooooo......",
+    "......occoBbbbbo.....",
+    ".....ocCCCooooo......",
 ]
 
 TRIPLESET = [
@@ -70,9 +72,9 @@ TRIPLESET = [
     "......oSSSsssslllso..",
     "......oSoSSsssSSsso..",
     "......oSloSsssssso...",
-    "......oSSloSSSSSo....",
-    "......oSSSloooooo....",
-    "......oSSSSo.........",
+    ".....occccoSSSSSo....",
+    "....ocCCCCCoooooo....",
+    "....ocCCCCCCo........",
 ]
 HEAD_NECK = {'franco': (10, 21), 'tripleset': (10, 21)}   # template pixel on the neck top
 
@@ -233,37 +235,61 @@ THIGH, SHIN = 6.0, 6.2
 UARM, FARM = 4.4, 4.2
 
 
+# Run cycle: 8 frames built from the four classic key poses per step
+# (contact, down, push-off/passing, flight), then mirrored onto the other leg.
+# Upright torso with a light ~13 degree lean, head carried level, elbows bent
+# near 90 degrees and swinging opposite the legs, 1px body bob (lowest on the
+# down pose, highest in flight).
+RUN_FOOT = [   # near-leg ankle per phase: (dx from hip, y, toe angle)
+    (5.0, 43.5, -0.25),   # 0 contact: heel strikes ahead of the hip
+    (1.5, 43.5, 0.0),     # 1 down: foot planted under the body, knee bent
+    (-3.5, 43.0, 0.35),   # 2 push: rolling off the toe behind
+    (-7.5, 40.0, 0.55),   # 3 flight: trailing leg extended
+    (-6.5, 36.5, 0.45),   # 4 recovery: heel kicks up behind
+    (-2.0, 35.0, 0.2),    # 5 tuck: foot under the seat, knee swinging through
+    (3.0, 36.5, -0.1),    # 6 knee drive: thigh high in front
+    (5.5, 40.5, -0.25),   # 7 reach: shin extends to meet the ground
+]
+RUN_HAND = [   # near-arm hand per phase, relative to the neck (opposite the near leg)
+    (-4.0, 7.0), (-3.0, 7.5), (-0.5, 8.0), (3.0, 6.5),
+    (4.5, 5.0), (3.5, 6.0), (0.5, 8.0), (-3.0, 7.5),
+]
+RUN_BOB = [0, 1, 0, -1, 0, 1, 0, -1]          # +1 = 1px lower
+RUN_N = len(RUN_FOOT)
+
+
 def run_pose(i):
-    ph = i / 6 * 2 * math.pi
-    bob = -1.0 if i % 3 == 1 else 0.0
-    hip = (13.5, 31.5 + bob)
-    neck = (18.0, 23.0 + bob)
-    legs = []
-    for k, p in enumerate((ph, ph + math.pi)):
-        fx = hip[0] + 9.0 * math.sin(p)
-        lift = 6.0 * max(0.0, math.cos(p))
-        fy = 43.5 - lift
-        ang = 0.35 * math.cos(p) - 0.15 if lift > 0.5 else -0.05
-        legs.append(((fx, fy), ang))
-    arms = []
-    for p in (ph + math.pi, ph):              # arm swings opposite its leg
-        s = math.sin(p)
-        hand = (neck[0] - 0.5 + 7.5 * s, neck[1] + 7.0 - 3.0 * max(0.0, s) + 1.0 * min(0.0, s))
-        arms.append(hand)
-    return dict(hip=hip, neck=neck, feet=legs, hands=arms, head=(0, 0), kbend=1)
+    b = RUN_BOB[i]
+    hip = (15.0, 32.0 + b)
+    neck = (17.0, 23.0 + b)
+    feet = []
+    for k in (i, (i + RUN_N // 2) % RUN_N):     # near leg, far leg half a cycle later
+        dx, fy, ang = RUN_FOOT[k]
+        feet.append(((hip[0] + dx, fy), ang))
+    hands = []
+    for k in (i, (i + RUN_N // 2) % RUN_N):
+        dx, dy = RUN_HAND[k]
+        hands.append((neck[0] + dx, neck[1] + dy))
+    return dict(hip=hip, neck=neck, feet=feet, hands=hands, head=(0, 0), kbend=1, elbow=-1)
 
 
 def static_pose(kind):
-    if kind in ('idle0', 'idle1'):
+    if kind in ('idle0', 'idle1'):            # relaxed ready stance; idle1 is the breath out
         b = 1 if kind == 'idle1' else 0
-        return dict(hip=(15.0, 31.5), neck=(16.5, 22.5 + b * 0.5), feet=[((19.5, 43.5), 0.0), ((12.0, 43.5), 0.0)],
-                    hands=[(20.0, 31.0 + b), (12.5, 31.0 + b)], head=(0, b), kbend=1, elbow=-1)
-    if kind == 'jump':
-        return dict(hip=(15.0, 30.0), neck=(17.0, 21.5), feet=[((22.0, 38.5), 0.3), ((10.0, 41.0), 0.6)],
-                    hands=[(11.5, 31.0), (8.0, 28.0)], head=(0, 0), kbend=1, elbow=1)
-    if kind == 'fall':
-        return dict(hip=(15.0, 30.0), neck=(16.5, 21.0), feet=[((20.0, 42.0), 0.1), ((11.0, 41.0), -0.2)],
-                    hands=[(25.5, 25.0), (7.0, 24.0)], head=(0, 0), kbend=1)
+        return dict(hip=(15.5, 32.0), neck=(16.5, 23.0 + b), feet=[((19.0, 43.5), 0.0), ((12.5, 43.5), 0.0)],
+                    hands=[(19.5, 32.0 + b), (13.0, 32.0 + b)], head=(0, 0), kbend=1, elbow=-1)
+    if kind == 'jump':                         # take-off: near knee drives up, far leg trails the push
+        return dict(hip=(15.0, 30.0), neck=(16.5, 21.0), feet=[((19.0, 36.5), -0.2), ((11.5, 41.5), 0.6)],
+                    hands=[(10.5, 26.5), (21.5, 26.0)], head=(0, 0), kbend=1, elbow=-1)
+    if kind == 'apex':                         # top of the arc: knees tucked, arms out for balance
+        return dict(hip=(15.0, 30.5), neck=(16.5, 21.5), feet=[((18.5, 37.5), 0.0), ((13.0, 38.5), 0.3)],
+                    hands=[(22.0, 27.0), (9.5, 27.5)], head=(0, 0), kbend=1, elbow=-1)
+    if kind == 'fall':                         # dropping: legs reach for the ground, arms lift
+        return dict(hip=(15.0, 30.0), neck=(16.5, 21.0), feet=[((18.5, 42.0), -0.1), ((12.5, 40.5), 0.3)],
+                    hands=[(22.5, 25.0), (9.0, 24.5)], head=(0, 0), kbend=1, elbow=-1)
+    if kind == 'land':                         # squash on touchdown
+        return dict(hip=(15.0, 34.5), neck=(17.0, 25.5), feet=[((19.5, 43.5), 0.0), ((11.5, 43.5), 0.0)],
+                    hands=[(21.5, 33.0), (12.5, 33.5)], head=(0, 0), kbend=1, elbow=-1)
     if kind == 'hurt':
         return dict(hip=(15.0, 31.0), neck=(12.5, 23.0), feet=[((22.0, 40.0), 0.4), ((18.0, 43.5), 0.0)],
                     hands=[(23.5, 28.0), (5.0, 25.0)], head=(-4, 1), kbend=1, face='hurt')
@@ -344,8 +370,8 @@ def hurt_face(tpl):
     return [''.join(r) for r in out]
 
 
-ORDER = ['run%d' % i for i in range(6)] + ['idle0', 'idle1', 'jump', 'fall',
-                                           'hurt', 'slide', 'cheer0', 'cheer1']
+ORDER = ['run%d' % i for i in range(RUN_N)] + ['idle0', 'idle1', 'jump', 'apex', 'fall', 'land',
+                                               'hurt', 'slide', 'cheer0', 'cheer1']
 
 
 def preview(path, frames, scale=4):

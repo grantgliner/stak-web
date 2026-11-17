@@ -33,7 +33,7 @@ The generated assets in `src/gen/` are committed, so Python is only needed if yo
 
 ## How it works
 
-- **Characters** come from `tools/chars.py`. Each 32×48 frame is built from a hand-pixeled 3/4 head (Franco's quiff, beard and roman nose; tripleset's curls and square jaw) on a posed skeleton. Every limb, the torso, the fists and the oversized sneakers are drawn with their own outline in depth order. Frames stream into sprite VRAM as they are needed.
+- **Characters** come from `tools/chars.py`. Each 32×48 frame is built from a hand-pixeled 3/4 head (Franco's quiff, beard and roman nose; tripleset's curls and square jaw) on a posed skeleton. The run is an 8-frame cycle built from the classic key poses (contact, down, push-off, flight), with an upright lean, opposing arm swing and a 1px bob. Jumps use separate take-off, apex, fall and landing-squash frames. Every limb, the torso, the fists and the oversized sneakers are drawn with their own outline in depth order. Frames stream into sprite VRAM as they are needed.
 - **Run stage** (`src/run.c`, art from `tools/gen_run.py`, level from `tools/gen_level.py`) runs in Mode 0:
   - Four layers: a far skyline, a parallax mid layer streamed by column, the road, and a text HUD. The sky gradient is drawn with HBlank DMA.
   - Each hover car shows a warning before it arrives, then crosses toward you. You can stomp it from above or slide under it.

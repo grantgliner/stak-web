@@ -13,23 +13,27 @@ extern const u32 road_tiles[184];
 extern const u16 road_pattern[40];
 extern const u16 pad_ids[8];
 extern const u16 run_obj_pal[144];
-extern const u32 char_franco[2688];
-extern const u32 char_tripleset[2688];
-#define CHAR_FRAMES 14
+extern const u32 char_franco[3456];
+extern const u32 char_tripleset[3456];
+#define CHAR_FRAMES 18
 #define CF_RUN0 0
 #define CF_RUN1 1
 #define CF_RUN2 2
 #define CF_RUN3 3
 #define CF_RUN4 4
 #define CF_RUN5 5
-#define CF_IDLE0 6
-#define CF_IDLE1 7
-#define CF_JUMP 8
-#define CF_FALL 9
-#define CF_HURT 10
-#define CF_SLIDE 11
-#define CF_CHEER0 12
-#define CF_CHEER1 13
+#define CF_RUN6 6
+#define CF_RUN7 7
+#define CF_IDLE0 8
+#define CF_IDLE1 9
+#define CF_JUMP 10
+#define CF_APEX 11
+#define CF_FALL 12
+#define CF_LAND 13
+#define CF_HURT 14
+#define CF_SLIDE 15
+#define CF_CHEER0 16
+#define CF_CHEER1 17
 extern const u32 car_tiles[2048];
 extern const u8 car_hit[16];
 extern const u32 hero_side_tiles[512];
