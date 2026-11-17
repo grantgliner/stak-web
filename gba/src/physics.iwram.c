@@ -2,6 +2,7 @@
 #include "physics.h"
 #include "gen/pieces_gen.h"
 _Static_assert(PIECE_MAX_VERTS <= MAX_VERTS, "piece parts have more vertices than physics.h allows");
+_Static_assert(PIECE_MAX_PARTS <= MAX_PARTS, "pieces have more parts than physics.h allows");
 #include "gen/tables_gen.h"
 
 #ifdef HOST
@@ -50,6 +51,10 @@ int phys_iters = 1;
 #define REST_VEL  FX(12.0)         /* only bounce above this approach speed */
 #define FRICTION  FX(0.8)
 #define FRICTION_BASE FX(0.9)
+/* Rolling resistance for contacts with a round part: the web version's circles
+   are 48-sided, so they sit still on a slope of up to ~3.75 degrees and slow
+   down as they roll. tan(3.75 deg) = 0.066. */
+#define ROLL_RES  FX(0.066)
 #define SLEEP_LIN2 FX(0.6 * 0.6)
 #define SLEEP_ANG  FX(0.12)
 #ifndef SLEEP_TIME
@@ -104,7 +109,7 @@ static u16 arb_hash[ARB_HASH] EWRAM_BSS;
 typedef struct {
   u8 a, b, n, blk;                   /* bodies, points (1-2), use the 2-point block solver */
   u8 dyn;                            /* bit 0: a moves, bit 1: b moves (else it is ground) */
-  u8 pad; u16 arb;                   /* arbiter index */
+  u8 roll; u16 arb;                  /* a round part: rolling resistance (roll_c[arb]); arbiter index */
   fx nx, ny, fric;
   fx anx, any, bnx, bny;             /* normal scaled by each body's inverse mass (0 for ground) */
   fx k11, k12, k22, i11, i12, i22;   /* block solver */
@@ -114,7 +119,7 @@ typedef struct {
   fx mn, mt, Pn, Pt, sep0, vn0, maxPn;
 } SPt;
 #define MAX_MAN (MAX_PTS * 3 / 4)
-#define MAN_IW  (PTS_IW * 3 / 4)
+#define MAN_IW  (PTS_IW * 2 / 3)      /* resting blocks mostly touch with 2 points */
 static SMan mans[MAN_IW];
 static SPt pts[PTS_IW];
 static SMan mans_x[MAX_MAN - MAN_IW + 1] EWRAM_BSS;
@@ -122,6 +127,10 @@ static SPt pts_x[MAX_PTS - PTS_IW + 1] EWRAM_BSS;
 static int nman, npts;            /* totals this step */
 static int nman_iw, npts_iw;      /* how many of them are in IWRAM (a prefix) */
 static fx body_invM[MAX_BODIES] EWRAM_BSS, body_invI[MAX_BODIES] EWRAM_BSS;
+/* rolling resistance of a manifold with a round part (by arbiter index): an
+   angular impulse on the relative spin, at most lim x the normal impulse */
+typedef struct { fx lim, k, ia, ib, P; } RollC;
+static RollC roll_c[MAX_ARB] EWRAM_BSS;
 
 static u8 uf_parent[MAX_BODIES] EWRAM_BSS;
 static u8 wake_req[MAX_BODIES] EWRAM_BSS, wr_list[MAX_BODIES] EWRAM_BSS;   /* wake requests (phys_wake, impacts) */
@@ -171,6 +180,13 @@ static void transform_parts(int shape, fx px, fx py, fx c, fx s, Poly* out, V2* 
     Poly* w = &out[p];
     w->n = pp->n;
     fx pminx = 0x7FFFFFFF, pminy = 0x7FFFFFFF, pmaxx = -0x7FFFFFFF, pmaxy = -0x7FFFFFFF;
+    if (pp->n == 1) {           /* circle: centre and radius */
+      fx lx = pp->v[0][0], ly = pp->v[0][1], r = pp->nrm[0][0];
+      fx x = px + (fx)(((s64)c * lx - (s64)s * ly + 0x8000) >> 16);
+      fx y = py + (fx)(((s64)s * lx + (s64)c * ly + 0x8000) >> 16);
+      w->v[0].x = x; w->v[0].y = y; w->nrm[0].x = r; w->nrm[0].y = 0;
+      pminx = x - r; pmaxx = x + r; pminy = y - r; pmaxy = y + r;
+    } else
     for (int i = 0; i < pp->n; i++) {
       fx lx = pp->v[i][0], ly = pp->v[i][1];
       fx x = px + (fx)(((s64)c * lx - (s64)s * ly + 0x8000) >> 16);
@@ -293,9 +309,82 @@ static int collide(const Poly* A, const Poly* B, Manifold* m) {
   return k;
 }
 
+/* ---- round parts: one contact point, on the circle's surface. Collision runs
+   once per frame and only for round parts, so it lives in ROM to keep IWRAM
+   for the solver. ---- */
+ROM_CODE static u32 isqrt32(u32 x) {
+  u32 r = 0, bit = 1u << 30;
+  while (bit > x) bit >>= 2;
+  while (bit) {
+    if (x >= r + bit) { x -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+    bit >>= 2;
+  }
+  return r;
+}
+/* length of (dx, dy) and the unit vector along it (Q16); 0 if it is too short
+   to have a direction */
+ROM_CODE static fx unit_of(fx dx, fx dy, V2* n) {
+  u64 d2 = (u64)((s64)dx * dx + (s64)dy * dy);   /* Q32 */
+  int sh = 0;
+  while (d2 >= (1ull << 32)) { d2 >>= 2; sh++; }
+  fx len = (fx)(isqrt32((u32)d2) << sh);
+  if (len < 16) return 0;
+  u32 inv = recip(len);
+  n->x = (fx)(((s64)dx * inv + 0x8000) >> 16); n->y = (fx)(((s64)dy * inv + 0x8000) >> 16);
+  return len;
+}
+ROM_CODE static int collide_circles(V2 ca, fx ra, V2 cb, fx rb, Manifold* m) {
+  fx dx = cb.x - ca.x, dy = cb.y - ca.y, lim = ra + rb + sep_margin;
+  if (dx > lim || dx < -lim || dy > lim || dy < -lim) return 0;
+  V2 n = { 0, FX_ONE };
+  fx len = unit_of(dx, dy, &n);
+  if (len > lim) return 0;
+  fx sep = len - ra - rb, k = ra + (sep >> 1);
+  m->n = n; m->count = 1;
+  m->c[0].p.x = ca.x + fxmul(n.x, k); m->c[0].p.y = ca.y + fxmul(n.y, k);
+  m->c[0].sep = sep; m->c[0].feat = 0x4020;
+  return 1;
+}
+/* polygon P vs circle (c, r); normal from P to the circle */
+ROM_CODE static int collide_poly_circle(const Poly* P, V2 c, fx r, Manifold* m) {
+  int np = P->n, bi = 0; fx best = -0x7FFFFFFF;
+  for (int i = 0; i < np; i++) {
+    fx s = fxdot(P->nrm[i], (V2){ c.x - P->v[i].x, c.y - P->v[i].y });
+    if (s > best) { best = s; bi = i; }
+  }
+  fx lim = r + sep_margin;
+  if (best > lim) return 0;
+  V2 v1 = P->v[bi], v2 = P->v[bi + 1 == np ? 0 : bi + 1];
+  V2 n = P->nrm[bi]; fx sep = best - r; u16 f = 0x4000 | bi;
+  if (best > 0) {                    /* centre outside: nearest feature is this face or one of its ends */
+    fx ex = v2.x - v1.x, ey = v2.y - v1.y;
+    const V2* v = 0;
+    if ((s64)(c.x - v1.x) * ex + (s64)(c.y - v1.y) * ey <= 0) { v = &v1; f = 0x4010 | bi; }
+    else if ((s64)(c.x - v2.x) * ex + (s64)(c.y - v2.y) * ey >= 0) { v = &v2; f = 0x4010 | (bi + 1 == np ? 0 : bi + 1); }
+    if (v) {
+      fx len = unit_of(c.x - v->x, c.y - v->y, &n);
+      if (len > lim) return 0;
+      sep = len - r;
+    }
+  }
+  m->n = n; m->count = 1;
+  m->c[0].p.x = c.x - fxmul(n.x, r); m->c[0].p.y = c.y - fxmul(n.y, r);
+  m->c[0].sep = sep; m->c[0].feat = f;
+  return 1;
+}
+/* either part round; normal from A to B */
+ROM_CODE static int collide_round(const Poly* A, const Poly* B, Manifold* m) {
+  if (A->n == 1 && B->n == 1) return collide_circles(A->v[0], A->nrm[0].x, B->v[0], B->nrm[0].x, m);
+  if (B->n == 1) return collide_poly_circle(A, B->v[0], B->nrm[0].x, m);
+  if (!collide_poly_circle(B, A->v[0], A->nrm[0].x, m)) return 0;
+  m->n.x = -m->n.x; m->n.y = -m->n.y; m->c[0].feat |= 0x8000;
+  return 1;
+}
+
 /* the bodies live in EWRAM (slow 16-bit bus); the SAT reads every vertex
    several times, so work on IWRAM (stack) copies */
 static int collide_fast(const Poly* A, const Poly* B, Manifold* m) {
+  if (A->n == 1 || B->n == 1) return collide_round(A, B, m);
   Poly a, b;
   int na = A->n, nb = B->n;
   a.n = na; b.n = nb;
@@ -376,6 +465,11 @@ ROM_CODE int phys_overlaps(const Poly* polys, int n, fx tol) {
       if (!aabb_overlap(polys[k].bmin, polys[k].bmax, b->wp[p].bmin, b->wp[p].bmax, 0)) continue;
       int e;
       sep_margin = MARGIN;
+      if (polys[k].n == 1 || b->wp[p].n == 1) {
+        Manifold m;
+        if (collide_round(&polys[k], &b->wp[p], &m) && m.c[0].sep < -tol) return 1;
+        continue;
+      }
       if (max_separation(&polys[k], &b->wp[p], &e) > -tol) continue;
       if (max_separation(&b->wp[p], &polys[k], &e) > -tol) continue;
       return 1;
@@ -422,7 +516,7 @@ static inline fx inv_scale(fx x, u32 r, int rs) {
   return (fx)(rs >= 0 ? v >> rs : v << -rs);
 }
 
-static SPt* add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbiter* na, Arbiter* old, Arbiter* out) {
+static SPt* add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbiter* na, Arbiter* old, Arbiter* out, fx round_r) {
   Body* A = &phys_bodies[ai]; Body* B = &phys_bodies[bi];
   BodyVel* va = &phys_vel[ai]; BodyVel* vb = &phys_vel[bi];
   /* a sleeping body is solid ground for whatever touches it */
@@ -437,6 +531,12 @@ static SPt* add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbite
   mn->a = ai; mn->b = bi; mn->n = m->count; mn->blk = 0;
   mn->dyn = (imA ? 1 : 0) | (imB ? 2 : 0);
   mn->arb = na - out;
+  mn->roll = 0;
+  if (round_r && (iiA | iiB)) {
+    RollC* rc = &roll_c[mn->arb];
+    mn->roll = 1;
+    rc->lim = fxmul(ROLL_RES, round_r); rc->ia = iiA; rc->ib = iiB; rc->k = recip(iiA + iiB); rc->P = 0;
+  }
   mn->nx = nx; mn->ny = ny;
   mn->fric = ((A->flags | B->flags) & BODY_STATIC) ? FRICTION_BASE : FRICTION;
   mn->anx = fxmul(imA, nx); mn->any = fxmul(imA, ny); mn->bnx = fxmul(imB, nx); mn->bny = fxmul(imB, ny);
@@ -517,6 +617,11 @@ static int warm_start(SMan* m, int nm, SPt* s) {
       APPLY_N(m, va, vb, s->Pn, s->kna, s->knb);
       APPLY_T(m, va, vb, s->Pt, s->kta, s->ktb);
     }
+    if (m->roll) {
+      const RollC* rc = &roll_c[m->arb];
+      if (m->dyn & 1) va->w -= fxmul(rc->P, rc->ia);
+      if (m->dyn & 2) vb->w += fxmul(rc->P, rc->ib);
+    }
   }
   return s - s0;
 }
@@ -586,6 +691,21 @@ __attribute__((noinline)) static void solve_block(SMan* m, SPt* s0, BodyVel* va,
   APPLY_N(m, va, vb, x1 - a1, s1->kna, s1->knb);
 }
 
+/* rolling resistance: hold the relative spin with an angular impulse limited by
+   the normal load (round parts touch at one point) */
+__attribute__((noinline)) static void solve_roll(const SMan* m, const SPt* s, BodyVel* va, BodyVel* vb) {
+  RollC* rc = &roll_c[m->arb];
+  fx lim = fxmul(rc->lim, s->Pn);
+  fx w = ((m->dyn & 2) ? vb->w : 0) - ((m->dyn & 1) ? va->w : 0);
+  fx P0 = rc->P, P = P0 - fxmul(rc->k, w);
+  if (P > lim) P = lim; else if (P < -lim) P = -lim;
+  rc->P = P;
+  fx dP = P - P0;
+  if (!dP) return;
+  if (m->dyn & 1) va->w -= fxmul(dP, rc->ia);
+  if (m->dyn & 2) vb->w += fxmul(dP, rc->ib);
+}
+
 __attribute__((noinline)) static int solve_contacts(SMan* m, int nm, SPt* s0, int use_bias) {
   /* per manifold: all normal constraints first, then friction (Box2D v3 order).
      Interleaving normal+friction per point made flat contacts drift sideways. */
@@ -610,6 +730,7 @@ __attribute__((noinline)) static int solve_contacts(SMan* m, int nm, SPt* s0, in
       s->Pt = Pt;
       APPLY_T(m, va, vb, Pt - Pt0, s->kta, s->ktb);
     }
+    if (m->roll) solve_roll(m, s0, va, vb);
     s0 += n;
   }
   return s0 - sb;
@@ -1039,7 +1160,11 @@ static int narrow_pair(int i, int j) {
     if (old && (s32)old->nx * (m.n.x >> 2) + (s32)old->ny * (m.n.y >> 2) < (s32)(0.9 * (1 << 28))) old = 0;
     PF1(3, tf);
     PF0(ta);
-    SPt* sp = add_points(i, j, pa, pb, &m, na, old, arbs);
+    fx rr = 0;
+    { const Poly* qa = &A->wp[pa]; const Poly* qb = &B->wp[pb];
+      if (qa->n == 1) rr = qa->nrm[0].x;
+      if (qb->n == 1 && (!rr || qb->nrm[0].x < rr)) rr = qb->nrm[0].x; }
+    SPt* sp = add_points(i, j, pa, pb, &m, na, old, arbs, rr);
     PF1(2, ta);
     /* a hard hit wakes a sleeping body even from above */
     for (int k = 0; k < m.count; k++) if (sp[k].vn0 < -IMPACT_WAKE) {

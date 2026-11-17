@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Generate STAK! GBA graphics: palettes, font, UI panels, starfield, base slab,
-sky gradient and the 8bpp title logo (converted from ../images/stak-logo.png)."""
+"""Generate STAK! GBA graphics: palettes, font, UI panels, base slab, the 8bpp
+title logo (converted from ../images/stak-logo.png) and a theme per mode: block
+colours, panel colours, sky gradient and a background layer (relaxed: clouds
+over a sunset beach; classic: stars; expert: champagne bubbles and gold
+sparkles on velvet)."""
 import os, sys, random, math
 import numpy as np
 from PIL import Image
@@ -53,6 +56,18 @@ def ramp(base, gloss=True):
     pal[10] = tuple(np.clip(c * 0.25 + 200, 0, 255))           # specular
     return [rgb15(p) for p in pal]
 
+MODES = ['relaxed', 'classic', 'expert']
+BLOCK_COLORS = {                    # the web version's tints per mode
+    'relaxed': ['#62FFFD', '#5BFF89', '#FFB74A', '#FFEE58'],
+    'classic': CLASSIC,
+    'expert': ['#FFFFFF', '#555555', '#CEA63D'],
+}
+def block_banks(cols):
+    banks = [ramp(c) for c in cols]
+    while len(banks) < 7: banks.append([0] * 16)
+    return [v for b in banks for v in b]
+mode_block_pal = [block_banks(BLOCK_COLORS[m]) for m in MODES]
+
 obj_pal = []
 for c in CLASSIC: obj_pal.append(ramp(c))
 obj_pal.append(ramp('#FF2A2A'))     # 7: collision red
@@ -63,25 +78,36 @@ ui[4] = rgb15((255, 138, 0)); ui[5] = rgb15((120, 220, 255))
 obj_pal.append(ui)                  # 9: UI sprites
 while len(obj_pal) < 16: obj_pal.append([0] * 16)
 
-bg_pal = [[0] * 16 for _ in range(6)]
-def textpal(fg, sh=(16, 18, 36)):
+# BG palettes 0-2 text, 3 panel, 4 panel highlighted (cursor), 5 background layer
+def textpal(fg, panel_fill, sh=(16, 18, 36)):
     p = [0] * 16; p[1] = rgb15(fg); p[2] = rgb15(sh)
-    p[4] = rgb15((22, 26, 52)); p[5] = rgb15((70, 80, 130)); p[6] = rgb15((40, 46, 86))
+    p[4] = rgb15(panel_fill)          # behind text on a panel
     return p
-bg_pal[0] = textpal((255, 255, 255))
-bg_pal[1] = textpal((255, 210, 60))
-bg_pal[2] = textpal((150, 160, 200))
-# 3: panel normal, 4: panel highlighted (cursor)
 def panelpal(border, fill, inner):
     p = [0] * 16; p[1] = rgb15(border); p[2] = rgb15(fill); p[3] = rgb15(inner); p[4] = rgb15((10, 12, 26))
     return p
-bg_pal[3] = panelpal((70, 82, 140), (20, 25, 52), (28, 34, 68))
-bg_pal[4] = panelpal((255, 170, 30), (52, 40, 40), (70, 52, 44))
-# 5: stars
-st = [0] * 16
-for i, c in enumerate([(255, 255, 255), (200, 210, 255), (140, 150, 210), (90, 100, 160), (255, 230, 170), (170, 255, 240)]):
-    st[1 + i] = rgb15(c)
-bg_pal[5] = st
+THEMES = {
+    # panel (border, fill, inner), highlighted panel, text grey, layer colours
+    'relaxed': dict(panel=((255, 226, 168), (20, 86, 108), (28, 102, 124)), hi=((255, 120, 84), (78, 48, 52), (98, 58, 58)),
+                    grey=(200, 226, 232),
+                    layer=[(255, 255, 255), (255, 244, 236), (255, 218, 206), (236, 190, 206), (190, 160, 200), (70, 62, 96)]),
+    'classic': dict(panel=((70, 82, 140), (20, 25, 52), (28, 34, 68)), hi=((255, 170, 30), (52, 40, 40), (70, 52, 44)),
+                    grey=(150, 160, 200),
+                    layer=[(255, 255, 255), (200, 210, 255), (140, 150, 210), (90, 100, 160), (255, 230, 170), (170, 255, 240)]),
+    'expert': dict(panel=((206, 166, 61), (16, 12, 20), (26, 20, 30)), hi=((250, 246, 236), (44, 34, 26), (60, 46, 34)),
+                   grey=(196, 178, 150),
+                   layer=[(224, 210, 180), (176, 146, 92), (122, 94, 50), (96, 72, 40), (240, 232, 214), (120, 82, 120)]),
+}
+def bg_palette(t):
+    fill = t['panel'][1]
+    banks = [textpal((255, 255, 255), fill), textpal((255, 210, 60), fill), textpal(t['grey'], fill),
+             panelpal(*t['panel']), panelpal(*t['hi'])]
+    layer = [0] * 16
+    for i, c in enumerate(t['layer']): layer[1 + i] = rgb15(c)
+    banks.append(layer)
+    return [v for b in banks for v in b]
+mode_bg_pal = [bg_palette(THEMES[m]) for m in MODES]
+bg_pal = [mode_bg_pal[1][i * 16:(i + 1) * 16] for i in range(6)]
 
 # ---------------------------------------------------------------- font (BG + OBJ use same layout)
 font = []; font_panel = []
@@ -165,9 +191,87 @@ for i in range(15):
         if i >= 13:  # sparkle
             t[y - 1, x] = t[y + 1, x] = t[y, x - 1] = t[y, x + 1] = 3
     star_tiles.append(t)
-stars = []
-for t in star_tiles: stars.extend(tiles4(t))
 star_map = [random.choice([0] * 6 + list(range(1, 16))) for _ in range(32 * 32)]
+
+def tiled(img):
+    """256x256 index image -> (unique tiles, 32x32 map), tile 0 blank"""
+    tiles, index, tmap = [np.zeros((8, 8), int)], {bytes(8 * 8): 0}, []
+    for ty in range(32):
+        for tx in range(32):
+            t = img[ty * 8:ty * 8 + 8, tx * 8:tx * 8 + 8]
+            k = t.astype(np.uint8).tobytes()
+            if k not in index:
+                index[k] = len(tiles); tiles.append(t.copy())
+            tmap.append(index[k])
+    return tiles, tmap
+
+# relaxed: puffy clouds lit from the low sun (layer colours 1 white .. 4 lilac shadow, 6 gull)
+def clouds():
+    rnd = random.Random(11)
+    img = np.zeros((256, 256), int)
+    spots = [(20, 26, 70), (150, 14, 56), (96, 80, 84), (8, 134, 52), (176, 118, 64), (60, 190, 76), (190, 210, 46)]
+    for x0, y0, w in spots:
+        h = w // 3
+        yy, xx = np.mgrid[0:h + 12, -8:w + 8]
+        x0 -= 8
+        m = np.zeros(yy.shape, bool)
+        base = h + 6                                   # flat bottom
+        m |= (((xx - w / 2) / (w / 2)) ** 2 + ((yy - base) / (h * 0.55)) ** 2 <= 1) & (yy <= base)
+        for _ in range(4):                             # puffs on top
+            cx = rnd.uniform(w * 0.22, w * 0.78); r = rnd.uniform(h * 0.45, h * 0.8)
+            cy = base - h * 0.35 - rnd.uniform(0, h * 0.3)
+            m |= ((xx - cx) ** 2 + (yy - cy) ** 2 <= r * r) & (yy <= base)
+        # light from the upper left: white top, warm and lilac shadows underneath
+        lvl = np.full(yy.shape, 1)
+        sh = (yy - (base - h * 0.9)) / (h * 0.9) + (xx / w - 0.5) * 0.35
+        assert not (m[:, 0] | m[:, -1]).any()
+        lvl[sh > 0.55] = 2; lvl[sh > 0.8] = 3; lvl[sh > 1.0] = 4
+        sub = img[y0:y0 + m.shape[0], x0:x0 + m.shape[1]]
+        mm = m[:sub.shape[0], :sub.shape[1]]
+        sub[mm] = lvl[:sub.shape[0], :sub.shape[1]][mm]
+    for gx, gy in [(122, 52), (134, 58), (40, 160), (214, 182)]:   # gulls
+        for dx, dy in [(-3, -1), (-2, 0), (-1, 0), (0, 1), (1, 0), (2, 0), (3, -1)]:
+            img[gy + dy, gx + dx] = 6
+    return img
+
+# expert: rising champagne bubbles and gold sparkles
+def bubbles():
+    rnd = random.Random(5)
+    img = np.zeros((256, 256), int)
+    def ring(cx, cy, r):
+        for y in range(-r - 1, r + 2):
+            for x in range(-r - 1, r + 2):
+                d = math.hypot(x, y)
+                if abs(d - r) < 0.6: img[(cy + y) % 256, (cx + x) % 256] = 2 if (x + y) < 0 else 3
+        img[(cy - r // 2) % 256, (cx - r // 2) % 256] = 1      # glint
+    for _ in range(7):                                          # columns of bubbles
+        x = rnd.randrange(8, 248); y = rnd.randrange(256)
+        for k in range(rnd.randrange(3, 7)):
+            ring(x + rnd.randrange(-2, 3), y, rnd.choice([1, 1, 2, 2, 3]))
+            y = (y + rnd.randrange(14, 30)) % 256
+    for _ in range(18):                                         # sparkles
+        x, y = rnd.randrange(4, 252), rnd.randrange(4, 252)
+        if rnd.random() < 0.4:
+            img[y, x] = 5
+            for d in (1, 2): img[y - d, x] = img[y + d, x] = img[y, x - d] = img[y, x + d] = 2 if d == 1 else 4
+        else:
+            img[y, x] = rnd.choice([2, 4])
+    return img
+
+layer_tiles, layer_maps = [], []
+for m in MODES:
+    if m == 'classic':
+        t, mp = star_tiles, star_map
+    else:
+        t, mp = tiled(clouds() if m == 'relaxed' else bubbles())
+    words = []
+    for tile in t: words.extend(tiles4(tile))
+    layer_tiles.append(words); layer_maps.append(mp)
+    prev = np.array([[0, 0, 0]] + [list(c) for c in THEMES[m]['layer']] + [[0, 0, 0]] * 9, np.uint8)
+    full = np.zeros((256, 256), int)
+    for i, v in enumerate(mp): full[(i // 32) * 8:(i // 32) * 8 + 8, (i % 32) * 8:(i % 32) * 8 + 8] = t[v]
+    Image.fromarray(prev[full]).save(os.path.join(PREV, f'layer_{m}.png'))
+    print(f'layer {m}: {len(t)} tiles')
 
 # ---------------------------------------------------------------- base slab sprite (98x24 -> 128x32, 2 x 64x32)
 def base_slab():
@@ -188,7 +292,7 @@ def base_slab():
     ys, xs = np.nonzero(mm)
     for y, x in zip(ys, xs):
         ty = (y - 0) / bh
-        lvl = 5.4 - ty * 3.2 - 0.6 * (x - xs.min()) / 98
+        lvl = 5.4 - ty * 3.2 - 0.5 * abs(x - 63.5) / 49     # symmetric: the right half is the left one flipped
         # top surface highlight (the base is seen slightly from above in the original)
         if y <= 2: lvl = 7.5
         elif y <= 4: lvl = 6.2
@@ -200,20 +304,29 @@ def base_slab():
     img[1, :][mm[1, :] & ~edge[1, :]] = 10
     return img
 slab = base_slab()
-base_words = tiles4_obj(slab[:, 0:64], 8, 4) + tiles4_obj(slab[:, 64:128], 8, 4)
+slab[:, 64:] = slab[:, 63::-1]                          # exactly symmetric
+base_words = tiles4_obj(slab[:, 0:64], 8, 4)           # left half; drawn twice, flipped
 
 # ---------------------------------------------------------------- sky gradient (BG backdrop via HBlank DMA)
 # 1024 lines: index 0 = highest point (deep space) ... 1023 = horizon at the base
-stops = [(0, (2, 2, 8)), (380, (6, 8, 28)), (640, (12, 18, 52)), (840, (24, 30, 82)), (960, (64, 46, 104)), (1023, (120, 70, 110))]
-sky = []
-for i in range(1024):
-    for k in range(len(stops) - 1):
-        a, ca = stops[k]; b, cb = stops[k + 1]
-        if a <= i <= b:
-            t = (i - a) / (b - a)
-            # ordered dither between neighbouring 15-bit colours
-            c = [ca[j] + (cb[j] - ca[j]) * t for j in range(3)]
-            sky.append(rgb15(c)); break
+SKY_STOPS = {
+    # relaxed: a beach at sunset, warm at the base, blue dusk higher up
+    'relaxed': [(0, (14, 18, 56)), (300, (28, 44, 108)), (560, (50, 88, 168)), (760, (92, 128, 200)),
+                (870, (156, 140, 200)), (950, (226, 150, 160)), (1000, (246, 172, 140)), (1023, (252, 196, 146))],
+    'classic': [(0, (2, 2, 8)), (380, (6, 8, 28)), (640, (12, 18, 52)), (840, (24, 30, 82)), (960, (64, 46, 104)), (1023, (120, 70, 110))],
+    # expert: black velvet with a wine-red glow at the base
+    'expert': [(0, (4, 2, 6)), (400, (14, 6, 20)), (700, (30, 10, 36)), (880, (50, 16, 50)), (980, (76, 26, 60)), (1023, (100, 40, 70))],
+}
+def gradient(stops):
+    out = []
+    for i in range(1024):
+        for k in range(len(stops) - 1):
+            a, ca = stops[k]; b, cb = stops[k + 1]
+            if a <= i <= b:
+                t = (i - a) / (b - a)
+                out.append(rgb15([ca[j] + (cb[j] - ca[j]) * t for j in range(3)])); break
+    return out
+skies = [gradient(SKY_STOPS[m]) for m in MODES]
 
 # ---------------------------------------------------------------- title logo (8bpp)
 LOGO_W, LOGO_H = 208, 88
@@ -271,7 +384,6 @@ def arrow():
     o = (pad[:-2, 1:-1] | pad[2:, 1:-1] | pad[1:-1, :-2] | pad[1:-1, 2:]) & ~m
     img[o] = 2
     return tiles4_obj(img[0:16, 0:16], 2, 2)[:0] or (tiles4(img[0:8, 0:8]) + tiles4(img[0:8, 8:16]) + tiles4(img[8:16, 0:8]) + tiles4(img[8:16, 8:16]))
-arrow_words = arrow()
 
 # ---------------------------------------------------------------- write
 def arr(name, ctype, data, per=12, fmt='0x{:08X}'):
@@ -283,26 +395,34 @@ def arr(name, ctype, data, per=12, fmt='0x{:08X}'):
 with open(OUT_H, 'w') as f:
     f.write('/* generated by tools/gen_gfx.py */\n#pragma once\n#include "../gba.h"\n')
     f.write(f'#define LOGO_W {LOGO_W}\n#define LOGO_H {LOGO_H}\n#define LOGO_COLOR_BASE 96\n#define LOGO_COLORS {len(logo_colors)}\n')
-    for n, t, d in [('obj_pal', 'u16', 256), ('bg_pal', 'u16', 96), ('font_tiles', 'u32', len(font)), ('font_panel_tiles', 'u32', len(font_panel)), ('bigdigit_tiles', 'u32', len(big)),
-                    ('panel_tiles', 'u32', len(panel)), ('star_tiles', 'u32', len(stars)), ('star_map', 'u16', 1024),
-                    ('base_tiles', 'u32', len(base_words)), ('sky_grad', 'u16', 1024), ('logo_tiles', 'u32', len(logo_words)),
-                    ('logo_pal', 'u16', len(logo_colors)), ('arrow_tiles', 'u32', len(arrow_words))]:
+    for n, t, d in [('obj_pal', 'u16', 256), ('font_tiles', 'u32', len(font)), ('font_panel_tiles', 'u32', len(font_panel)), ('bigdigit_tiles', 'u32', len(big)),
+                    ('panel_tiles', 'u32', len(panel)), ('base_tiles', 'u32', len(base_words)), ('logo_tiles', 'u32', len(logo_words)),
+                    ('logo_pal', 'u16', len(logo_colors))]:
         f.write(f'extern const {t} {n}[{d}];\n')
     f.write('enum { PANEL_FILL, PANEL_TOP, PANEL_BOT, PANEL_LEFT, PANEL_RIGHT, PANEL_TL, PANEL_TR, PANEL_BL, PANEL_BR };\n')
+    f.write('/* per mode (relaxed, classic, expert): BG palettes 0-5, block palettes (OBJ 0-6) and colour count,\n'
+            '   sky gradient (HBlank DMA), background layer tiles + map (BG2) */\n')
+    f.write('typedef struct { const u16* bg_pal; const u16* block_pal; u8 ncolors; const u16* sky; const u32* layer_tiles; u16 layer_words; const u16* layer_map; } Theme;\n')
+    f.write('extern const Theme themes[3];\n')
 
 with open(OUT_C, 'w') as f:
     f.write('/* generated by tools/gen_gfx.py */\n#include "gfx_gen.h"\n')
     f.write(arr('obj_pal', 'u16', [v for p in obj_pal for v in p], 16, '0x{:04X}'))
-    f.write(arr('bg_pal', 'u16', [v for p in bg_pal for v in p], 16, '0x{:04X}'))
     f.write(arr('font_tiles', 'u32', font))
     f.write(arr('font_panel_tiles', 'u32', font_panel))
     f.write(arr('bigdigit_tiles', 'u32', big))
     f.write(arr('panel_tiles', 'u32', panel))
-    f.write(arr('star_tiles', 'u32', stars))
-    f.write(arr('star_map', 'u16', [v | (5 << 12) for v in star_map], 16, '0x{:04X}'))
     f.write(arr('base_tiles', 'u32', base_words))
-    f.write(arr('sky_grad', 'u16', sky, 16, '0x{:04X}'))
     f.write(arr('logo_tiles', 'u32', logo_words))
     f.write(arr('logo_pal', 'u16', logo_colors, 16, '0x{:04X}'))
-    f.write(arr('arrow_tiles', 'u32', arrow_words))
+    for i, m in enumerate(MODES):
+        f.write(arr(f'{m}_bg_pal', 'u16', mode_bg_pal[i], 16, '0x{:04X}').replace('const u16', 'static const u16'))
+        f.write(arr(f'{m}_block_pal', 'u16', mode_block_pal[i], 16, '0x{:04X}').replace('const u16', 'static const u16'))
+        f.write(arr(f'{m}_sky', 'u16', skies[i], 16, '0x{:04X}').replace('const u16', 'static const u16'))
+        f.write(arr(f'{m}_layer_tiles', 'u32', layer_tiles[i]).replace('const u32', 'static const u32'))
+        f.write(arr(f'{m}_layer_map', 'u16', [v | (5 << 12) for v in layer_maps[i]], 16, '0x{:04X}').replace('const u16', 'static const u16'))
+    f.write('const Theme themes[3] = {\n')
+    for i, m in enumerate(MODES):
+        f.write(f'  {{ {m}_bg_pal, {m}_block_pal, {len(BLOCK_COLORS[m])}, {m}_sky, {m}_layer_tiles, {len(layer_tiles[i])}, {m}_layer_map }},\n')
+    f.write('};\n')
 print('font', len(font) // 8, 'tiles; logo', len(logo_words) // 16, 'tiles;', len(logo_colors), 'colours')

@@ -1,11 +1,12 @@
 #pragma once
 #include "gba.h"
+#include "gen/pieces_gen.h"
 
 /* VRAM layout */
 #define CBB_TEXT   0          /* BG0: font, big digits, panel tiles */
-#define CBB_STARS  1          /* BG2 */
+#define CBB_LAYER  1          /* BG2: the mode's background layer (stars, clouds, bubbles) */
 #define CBB_LOGO   2          /* BG1 (8bpp, spills into CBB 3) */
-#define SBB_STARS  29
+#define SBB_LAYER  29
 #define SBB_LOGO   30
 #define SBB_TEXT   31
 
@@ -15,10 +16,13 @@
 #define TILE_FONT_PANEL 160   /* font with panel-coloured background */
 #define TXT_ON_PANEL 0x100
 
-#define OBJ_TILE_PIECE(n) ((n) * 64)
-#define OBJ_TILE_BASE  768
-#define OBJ_TILE_ARROW 832
-#define OBJ_TILE_FONT  840
+/* OBJ tiles: the 16 block sprites (piece_defs[].tile), then the score pop-up
+   font ('+' to '9' only), then the left half of the base slab (64x32; the
+   right half is the same tiles flipped). That fills all 1024. */
+#define OBJ_FONT_FIRST '+'
+#define OBJ_TILE_FONT  PIECE_TILES
+#define OBJ_TILE_BASE  (PIECE_TILES + '9' - OBJ_FONT_FIRST + 1)
+_Static_assert(OBJ_TILE_BASE + 32 <= 1024, "OBJ tiles don't fit");
 
 #define PAL_TXT_WHITE 0
 #define PAL_TXT_YELLOW 1
@@ -35,6 +39,7 @@ extern u16 txt_map[32 * 32];
 extern int txt_dirty;
 
 void video_init(void);
+void video_set_theme(int mode);      /* 0 relaxed, 1 classic, 2 expert: colours, sky, background layer */
 void video_vsync(int sky_offset);    /* wait for vblank and push shadows */
 extern volatile u16 vblank_tick;      /* timer 2 (64-cycle ticks) when the last VBlank began */
 #define FRAME_TICKS 4389              /* 280896 cycles */

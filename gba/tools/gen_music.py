@@ -21,6 +21,10 @@ SONGS = [
     # vibrato delay/depth. Duty 0-3 = 12.5/25/50/75%; envelope = volume << 4 | decay step.
     dict(name='song_menu', midi='menu.mid', lead=(2, 0xA5), harm=(1, 0x63), bass=(1, 0), vib=(14, 3)),
     dict(name='song_classic', midi='classic.mid', lead=(1, 0xB4), harm=(2, 0x52), bass=(1, 1), vib=(10, 4)),
+    # relaxed: a round, plucked lead that rings out like a steel pan, soft stabs
+    dict(name='song_relaxed', midi='relaxed.mid', lead=(2, 0xB3), harm=(2, 0x41), bass=(1, 0), vib=(20, 2)),
+    # expert: a thin held lead with a wide, late vibrato over a punchy saw bass
+    dict(name='song_expert', midi='expert.mid', lead=(1, 0xA0), harm=(2, 0x43), bass=(1, 1), vib=(16, 5)),
 ]
 DRUMS = {35: 1, 36: 1, 38: 2, 40: 2, 39: 2, 42: 3, 44: 3, 46: 4}
 
@@ -84,6 +88,8 @@ def main():
         print(f'{name}: {ncell // 16} bars, {len(lead)} lead, {len(harm)} harmony, {len(bass)} bass, {len(drums)} drum events, '
               f'{frame_at(ncell) / FPS:.1f}s loop', file=sys.stderr)
     open(OUT, 'w').write('\n'.join(out))
+    names = ', '.join(sg['name'] for sg in SONGS)
+    open(OUT.replace('.c', '.h'), 'w').write(f'#pragma once\n#include "../sound.h"\nextern const Song {names};\n')
 
 
 if __name__ == '__main__':

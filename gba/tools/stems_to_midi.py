@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe audio/menu.m4a and audio/classic.m4a into 4-track MIDI files
+"""Transcribe audio/{menu,classic,easy,hard}.m4a into 4-track MIDI files
 (music/transcribed/<song>.mid: lead, harmony, bass, drums). These are a
 reference for the key, tempo and motifs; the game's tunes are arranged in
 tools/compose.py.
@@ -14,7 +14,7 @@ Pipeline:
 
 Only needed when the source audio changes; the MIDI output is committed.
 Needs: demucs, torch, basic-pitch (with onnxruntime), librosa, pretty_midi.
-  python3 tools/stems_to_midi.py [--work DIR]
+  python3 tools/stems_to_midi.py [--work DIR] [SONG...]
 """
 import argparse, os, subprocess, sys
 import numpy as np
@@ -29,6 +29,8 @@ OUT = os.path.join(ROOT, 'music', 'transcribed')
 SONGS = [
     ('menu', 108.98, 0.0138, None),
     ('classic', 166.0, 0.0086, None),
+    ('easy', 94.0, 0.1255, None),      # relaxed mode
+    ('hard', 110.0, 0.0942, None),     # expert mode
 ]
 DRUM_NOTES = {1: 36, 2: 38, 3: 42}   # GM kick, snare, closed hat
 
@@ -186,10 +188,13 @@ def write_midi(path, bpm, parts, c, cell0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--work', default=os.path.join(ROOT, 'build', 'stems'))
+    ap.add_argument('songs', nargs='*', help='only these songs (default: all)')
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
     for song, bpm, t0, cell0 in SONGS:
+        if a.songs and song not in a.songs:
+            continue
         c = 60 / bpm / 4
         d = separate(a.work, song)
         import soundfile as sf

@@ -6,16 +6,15 @@
 #define LOGO_COLOR_BASE 96
 #define LOGO_COLORS 150
 extern const u16 obj_pal[256];
-extern const u16 bg_pal[96];
 extern const u32 font_tiles[768];
 extern const u32 font_panel_tiles[768];
 extern const u32 bigdigit_tiles[320];
 extern const u32 panel_tiles[72];
-extern const u32 star_tiles[128];
-extern const u16 star_map[1024];
-extern const u32 base_tiles[512];
-extern const u16 sky_grad[1024];
+extern const u32 base_tiles[256];
 extern const u32 logo_tiles[4576];
 extern const u16 logo_pal[150];
-extern const u32 arrow_tiles[32];
 enum { PANEL_FILL, PANEL_TOP, PANEL_BOT, PANEL_LEFT, PANEL_RIGHT, PANEL_TL, PANEL_TR, PANEL_BL, PANEL_BR };
+/* per mode (relaxed, classic, expert): BG palettes 0-5, block palettes (OBJ 0-6) and colour count,
+   sky gradient (HBlank DMA), background layer tiles + map (BG2) */
+typedef struct { const u16* bg_pal; const u16* block_pal; u8 ncolors; const u16* sky; const u32* layer_tiles; u16 layer_words; const u16* layer_map; } Theme;
+extern const Theme themes[3];

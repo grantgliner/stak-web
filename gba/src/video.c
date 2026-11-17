@@ -11,8 +11,7 @@ static u16 sky_ram[1024] EWRAM_BSS __attribute__((aligned(4)));   /* DMA0 can't 
 
 void video_init(void) {
   REG_DISPCNT = 0x0080;   /* forced blank while loading */
-  /* palettes */
-  for (int i = 0; i < 96; i++) PAL_BG[i] = bg_pal[i];
+  /* palettes (the mode theme sets BG 0-5 and OBJ 0-6) */
   for (int i = 0; i < LOGO_COLORS; i++) PAL_BG[LOGO_COLOR_BASE + i] = logo_pal[i];
   for (int i = 0; i < 256; i++) PAL_OBJ[i] = obj_pal[i];
   /* BG tiles */
@@ -20,14 +19,11 @@ void video_init(void) {
   dma3_copy32(CHARBLOCK(CBB_TEXT) + TILE_FONT_PANEL * 16, font_panel_tiles, sizeof(font_panel_tiles) / 4);
   dma3_copy32(CHARBLOCK(CBB_TEXT) + TILE_BIG * 16, bigdigit_tiles, sizeof(bigdigit_tiles) / 4);
   dma3_copy32(CHARBLOCK(CBB_TEXT) + TILE_PANEL * 16, panel_tiles, sizeof(panel_tiles) / 4);
-  dma3_copy32(CHARBLOCK(CBB_STARS), star_tiles, sizeof(star_tiles) / 4);
-  dma3_copy32(SCREENBLOCK(SBB_STARS), star_map, sizeof(star_map) / 4);
   dma3_copy32(CHARBLOCK(CBB_LOGO), logo_tiles, sizeof(logo_tiles) / 4);
   /* OBJ tiles */
-  for (int i = 0; i < PIECE_COUNT; i++) dma3_copy32(OBJ_TILES + OBJ_TILE_PIECE(i) * 16, piece_tiles[i], 512);
+  dma3_copy32(OBJ_TILES, piece_tiles, sizeof(piece_tiles) / 4);
   dma3_copy32(OBJ_TILES + OBJ_TILE_BASE * 16, base_tiles, sizeof(base_tiles) / 4);
-  dma3_copy32(OBJ_TILES + OBJ_TILE_ARROW * 16, arrow_tiles, sizeof(arrow_tiles) / 4);
-  dma3_copy32(OBJ_TILES + OBJ_TILE_FONT * 16, font_tiles, sizeof(font_tiles) / 4);
+  dma3_copy32(OBJ_TILES + OBJ_TILE_FONT * 16, font_tiles + (OBJ_FONT_FIRST - 32) * 8, (OBJ_TILE_BASE - OBJ_TILE_FONT) * 8);
   /* logo map: LOGO_W/8 x LOGO_H/8 tiles at (2,1) */
   dma3_fill32(SCREENBLOCK(SBB_LOGO), 0, 512);
   {
@@ -36,8 +32,8 @@ void video_init(void) {
   }
   REG_BGCNT[0] = BG_PRIO(1) | BG_CBB(CBB_TEXT) | BG_SBB(SBB_TEXT);
   REG_BGCNT[1] = BG_PRIO(1) | BG_CBB(CBB_LOGO) | BG_SBB(SBB_LOGO) | BG_8BPP;
-  REG_BGCNT[2] = BG_PRIO(3) | BG_CBB(CBB_STARS) | BG_SBB(SBB_STARS);
-  dma3_copy32(sky_ram, sky_grad, 512);
+  REG_BGCNT[2] = BG_PRIO(3) | BG_CBB(CBB_LAYER) | BG_SBB(SBB_LAYER);
+  video_set_theme(1);
   txt_clear();
   oam_clear();
   for (int i = 0; i < 128; i++) ((volatile ObjAttr*)MEM_OAM)[i].attr0 = ATTR0_HIDE;
@@ -65,6 +61,15 @@ void vblank_isr(void) {
   REG_DMA0DAD = (u32)PAL_BG;
   REG_DMA0CNT = DMA_ENABLE | DMA_HBLANK | DMA_REPEAT | DMA_DST_FIXED | 1;
   snd_tick();
+}
+
+void video_set_theme(int mode) {
+  const Theme* t = &themes[mode];
+  for (int i = 1; i < 96; i++) PAL_BG[i] = t->bg_pal[i];      /* 0 is the backdrop: the sky DMA owns it */
+  for (int i = 0; i < 7 * 16; i++) PAL_OBJ[i] = t->block_pal[i];
+  dma3_copy32(sky_ram, t->sky, 512);
+  dma3_copy32(CHARBLOCK(CBB_LAYER), t->layer_tiles, t->layer_words);
+  dma3_copy32(SCREENBLOCK(SBB_LAYER), t->layer_map, 512);
 }
 
 void video_vsync(int sky_offset) {

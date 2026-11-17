@@ -1,4 +1,4 @@
-/* STAK! GBA - title screen, classic mode, game over. */
+/* STAK! GBA - title screen with the mode picker, relaxed / classic / expert play, game over. */
 #include "gba.h"
 #include "physics.h"
 #include "video.h"
@@ -6,6 +6,7 @@
 #include "save.h"
 #include "gen/pieces_gen.h"
 #include "gen/music_gen.h"
+#include "gen/gfx_gen.h"
 
 /* ------------------------------------------------------------------ constants */
 #define PX_PER_CELL 12
@@ -24,9 +25,19 @@
 enum { ST_TITLE, ST_PLAY, ST_PAUSE, ST_OVER };
 enum { MTX_TRAY = 0, MTX_TRAY_HI = 1, MTX_HELD = 2, MTX_DYN = 3 };
 
-/* classic mode piece pool (same weighting as the original: the 7 "easy"
- * shapes appear twice as often as S, Z, T, Zig and Zag) */
-static const u8 classic_pool[19] = { 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+/* piece pools, weighted like the web version's: piece indices are
+   0 Plus, 1 Rectangle, 2 L, 3 L-Reverse, 4 Arrow, 5 PlusCut, 6 PeterPan, 7 S,
+   8 Z, 9 T, 10 Zig, 11 Zag, 12 Circle, 13 Semicircle, 14 Lollipop, 15 Seesaw */
+static const u8 pool_relaxed[] = { 0, 2, 3, 1, 0, 2, 3, 1, 7, 8, 7, 8, 9, 10, 11 };
+static const u8 pool_classic[] = { 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+static const u8 pool_expert[] = { 0, 2, 3, 1, 6, 5, 4, 7, 8, 12, 13, 14, 15, 0, 2, 3, 1, 6, 5, 4, 7, 8, 12, 13, 14, 15, 9, 10, 11 };
+enum { MODE_RELAXED, MODE_CLASSIC, MODE_EXPERT };
+typedef struct { const char* name; const char* desc; const u8* pool; u8 npool; const Song* song; } ModeDef;
+static const ModeDef modes[3] = {
+  { "RELAXED", "STACK SIMPLE SHAPES!", pool_relaxed, sizeof pool_relaxed, &song_relaxed },
+  { "CLASSIC", "STACK TRICKIER ANGLES!", pool_classic, sizeof pool_classic, &song_classic },
+  { "EXPERT", "STACK CURVES AND ANGLES!", pool_expert, sizeof pool_expert, &song_expert },
+};
 
 static const char* const messages[50] = {
   "Seriously?", "That's it?", "I mean... it's something.", "It's a magic number.",
@@ -49,7 +60,7 @@ static const char* const messages[50] = {
 };
 
 /* ------------------------------------------------------------------ state */
-static int state;
+static int state, mode = MODE_CLASSIC;
 static u32 frame;
 static u16 keys, keys_prev, keys_down;
 static u32 rng = 0x1234567;
@@ -63,11 +74,11 @@ static int blocks, score, new_best;
 static fx cam_y, cam_target;
 static int over_t, over_shown, pause_sel;
 static int pop_t, pop_val; static fx pop_x, pop_y;
-static int last_placed = -1;
+static int last_placed = -1, last_color = -1;
 
 /* title decoration */
-typedef struct { fx x, y, a, vy, w; u8 shape, color; } Deco;
-static Deco deco[8];
+typedef struct { fx x, y, a, vy, w; u8 seed, color; } Deco;   /* shape and colour follow the mode */
+static Deco deco[8] EWRAM_BSS;
 static int logo_t;
 
 /* ------------------------------------------------------------------ helpers */
@@ -83,12 +94,25 @@ static void read_keys(void) {
 static inline int sx_of(fx x) { return SCREEN_CX + (int)(((s64)x * PX_PER_CELL) >> 16); }
 static inline int sy_of(fx y) { return BASE_SY - (int)(((s64)(y - cam_y) * PX_PER_CELL) >> 16); }
 
-static void put_affine(ObjAttr* o, int sx, int sy, int tile, int pal, int mtx, int prio, int blend) {
-  int x = sx - 32, y = sy - 32;
-  if (x <= -64 || x >= 240 || y <= -64 || y >= 160) { o->attr0 = ATTR0_HIDE; return; }
-  o->attr0 = ATTR0_Y(y) | ATTR0_AFF | ATTR0_SQUARE | (blend ? ATTR0_BLEND : 0);
-  o->attr1 = ATTR1_X(x) | ATTR1_AFFIDX(mtx) | ATTR1_SIZE_64;
-  o->attr2 = ATTR2_TILE(tile) | ATTR2_PRIO(prio) | ATTR2_PAL(pal);
+/* a block sprite with its COM at (sx, sy), turned by (c, s): the sprite is
+   centred on the COM, or on the piece's box with the offset turned too (the
+   lollipop). mtx: an affine matrix, or PLAIN_UP / PLAIN_DOWN for a plain sprite
+   (cheaper per scanline) upright or flipped to 180 degrees. c = s = 0 centres
+   it on its box (the tray). */
+#define PLAIN_UP   (-1)
+#define PLAIN_DOWN (-2)
+static void put_piece(ObjAttr* o, int shape, int sx, int sy, fx c, fx s, int pal, int mtx, int prio, int blend) {
+  const PieceDef* d = &piece_defs[shape];
+  if (d->sox | d->soy) {
+    fx ox = fxmul(c, d->sox) - fxmul(s, d->soy), oy = fxmul(s, d->sox) + fxmul(c, d->soy);
+    sx += (ox * PX_PER_CELL + 0x8000) >> 16; sy -= (oy * PX_PER_CELL + 0x8000) >> 16;
+  }
+  int half = d->small ? 16 : 32, x = sx - half, y = sy - half;
+  if (x <= -2 * half || x >= 240 || y <= -2 * half || y >= 160) { o->attr0 = ATTR0_HIDE; return; }
+  o->attr0 = ATTR0_Y(y) | (mtx >= 0 ? ATTR0_AFF : 0) | ATTR0_SQUARE | (blend ? ATTR0_BLEND : 0);
+  o->attr1 = ATTR1_X(x) | (d->small ? ATTR1_SIZE_32 : ATTR1_SIZE_64) |
+             (mtx >= 0 ? ATTR1_AFFIDX(mtx) : mtx == PLAIN_DOWN ? ATTR1_HFLIP | ATTR1_VFLIP : 0);
+  o->attr2 = ATTR2_TILE(d->tile) | ATTR2_PRIO(prio) | ATTR2_PAL(pal);
 }
 
 /* affine matrix cache for physics bodies, keyed by quantized angle */
@@ -108,14 +132,17 @@ static int mtx_for_angle(fx c, fx s, fx angle) {
 }
 
 static Slot new_slot(int idx) {
+  const ModeDef* md = &modes[mode];
   Slot s;
   for (;;) {
-    s.shape = classic_pool[rnd_n(19)];
+    s.shape = md->pool[rnd_n(md->npool)];
     int clash = 0;
     for (int k = 0; k < 3; k++) if (k != idx && tray[k].shape == s.shape) clash = 1;
     if (!clash) break;
   }
-  s.color = rnd_n(7);
+  /* a new colour each time, so neighbours stand apart (expert has only three) */
+  do s.color = rnd_n(themes[mode].ncolors); while (s.color == last_color);
+  last_color = s.color;
   return s;
 }
 
@@ -138,16 +165,35 @@ static void draw_hud(void) {
   txt_clear_rect(20, 0, 12, 5);
   txt_put(23, 0, "BLOCKS", PAL_TXT_YELLOW);
   txt_big_num(30, 1, blocks, PAL_TXT_WHITE);
-  char b[16] = "BEST "; fmt_int(b + 5, save.best_blocks > blocks ? save.best_blocks : blocks);
+  char b[16] = "BEST "; fmt_int(b + 5, save.best[mode] > blocks ? save.best[mode] : blocks);
   int n = 0; while (b[n]) n++;
   txt_put(30 - n, 3, b, PAL_TXT_GRAY);
 }
 
 /* ------------------------------------------------------------------ title */
+/* the mode picker: name, what it is, best */
+static void draw_mode_picker(void) {
+  int on = TXT_ON_PANEL;
+  txt_panel(1, 13, 28, 6, PAL_PANEL);
+  txt_put(3, 14, "<", PAL_TXT_WHITE | on); txt_put(26, 14, ">", PAL_TXT_WHITE | on);
+  char b[24]; int n = 0;
+  for (const char* p = modes[mode].name; *p; p++) b[n++] = *p;
+  for (const char* p = " MODE"; *p; p++) b[n++] = *p;
+  b[n] = 0;
+  txt_center(14, 1, 28, b, PAL_TXT_YELLOW | on);
+  txt_center(15, 1, 28, modes[mode].desc, PAL_TXT_GRAY | on);
+  char c[16] = "BEST "; fmt_int(c + 5, save.best[mode]);
+  txt_center(17, 1, 28, c, PAL_TXT_WHITE | on);
+  txt_put(22, 19, "HOMEBREW", PAL_TXT_GRAY);
+}
+
 static void title_enter(void) {
   state = ST_TITLE;
   phys_init();
   txt_clear();
+  mode = save.mode;
+  video_set_theme(mode);
+  REG_BGHOFS(2) = 0;
   REG_DISPCNT = DCNT_MODE0 | DCNT_OBJ_1D | DCNT_BG0 | DCNT_BG1 | DCNT_BG2 | DCNT_OBJ;
   REG_BLDCNT = 0;
   logo_t = 0;
@@ -157,14 +203,20 @@ static void title_enter(void) {
     d->y = FX(2) + i * FX(2.2);
     d->vy = FX(0.012) + rnd_n(FX(0.02));
     d->a = rnd_n(FX(6.28)); d->w = rnd_n(FX(0.04)) - FX(0.02);
-    d->shape = rnd_n(PIECE_COUNT); d->color = rnd_n(7);
+    d->seed = rnd_n(256); d->color = rnd_n(7);
   }
-  char b[24];
-  txt_center(17, 0, 30, "BEST", PAL_TXT_GRAY);
-  fmt_int(b, save.best_blocks); txt_center(18, 0, 30, b, PAL_TXT_WHITE);
-  txt_put(1, 19, "CLASSIC MODE", PAL_TXT_GRAY);
-  txt_put(22, 19, "HOMEBREW", PAL_TXT_GRAY);
+  draw_mode_picker();
   snd_play_song(&song_menu);
+}
+
+/* the background layer drifts: clouds blow sideways, champagne bubbles rise,
+   stars sink slowly on the title; it scrolls at a quarter of the camera */
+static void layer_scroll(fx cam) {
+  int y = -(int)(((s64)cam * PX_PER_CELL) >> 18);
+  if (mode == MODE_RELAXED) REG_BGHOFS(2) = (u16)(frame / 6);
+  if (mode == MODE_EXPERT) y += frame / 3;
+  else if (state == ST_TITLE && mode == MODE_CLASSIC) y -= frame / 4;
+  REG_BGVOFS(2) = (u16)y;
 }
 
 static void title_update(void) {
@@ -174,12 +226,12 @@ static void title_update(void) {
   if (logo_t < 40) { int t = 40 - logo_t; off = t * t * 110 / 1600; }
   else if (logo_t < 52) { int t = logo_t - 46; off = 6 - (t * t) / 6; if (off < 0) off = 0; off = -off; }
   else off = (fx_sin((logo_t - 52) * 2400) * 3) >> 16;
-  REG_BGVOFS(1) = (u16)(off - 10);
+  REG_BGVOFS(1) = (u16)(off - 5);
   REG_BGHOFS(1) = 0;
   /* blinking prompt */
   if (logo_t > 50) {
-    if ((logo_t / 32) & 1) txt_clear_rect(0, 14, 30, 1);
-    else txt_center(14, 0, 30, "PRESS START", PAL_TXT_WHITE);
+    if ((logo_t / 32) & 1) txt_clear_rect(0, 12, 30, 1);
+    else txt_center(12, 0, 30, "PRESS START", PAL_TXT_WHITE);
   }
   /* falling decorative blocks */
   oam_reset_alloc(0); mtx_used = 0;
@@ -187,15 +239,25 @@ static void title_update(void) {
     Deco* d = &deco[i];
     d->y -= d->vy; d->a += d->w;
     if (d->a > FX_PI) d->a -= 2 * FX_PI; if (d->a < -FX_PI) d->a += 2 * FX_PI;
-    if (d->y < FX(-3)) { d->y = FX(15); d->x = FX(-10) + rnd_n(FX(16)); d->shape = rnd_n(PIECE_COUNT); d->color = rnd_n(7); }
+    if (d->y < FX(-3)) { d->y = FX(15); d->x = FX(-10) + rnd_n(FX(16)); d->seed = rnd_n(256); d->color = rnd_n(7); }
     ObjAttr* o = oam_alloc();
-    int m = mtx_for_angle(fx_cos(d->a), fx_sin(d->a), d->a);
+    fx c = fx_cos(d->a), s = fx_sin(d->a);
+    int m = mtx_for_angle(c, s, d->a);
     int sx = 120 + (int)(((s64)d->x * PX_PER_CELL) >> 16) + (i & 1 ? 40 : -40);
-    put_affine(o, sx, BASE_SY - (int)(((s64)d->y * PX_PER_CELL) >> 16), OBJ_TILE_PIECE(d->shape), d->color, m, 2, 0);
+    put_piece(o, modes[mode].pool[d->seed % modes[mode].npool], sx, BASE_SY - (int)(((s64)d->y * PX_PER_CELL) >> 16), c, s,
+              d->color % themes[mode].ncolors, m, 2, 0);
   }
-  REG_BGVOFS(2) = (u16)(-(int)(frame / 4));
+  layer_scroll(0);
+  if (keys_down & (KEY_LEFT | KEY_RIGHT)) {
+    mode = (mode + ((keys_down & KEY_RIGHT) ? 1 : 2)) % 3;
+    video_set_theme(mode);
+    REG_BGHOFS(2) = 0;
+    draw_mode_picker();
+    snd_sfx(SFX_SELECT);
+  }
   if (keys_down & (KEY_START | KEY_A)) {
     rng ^= frame * 2654435761u; if (!rng) rng = 1;
+    if (save.mode != mode) { save.mode = mode; save_write(); }
     snd_sfx(SFX_SELECT);
     extern void play_enter(void);
     play_enter();
@@ -213,6 +275,9 @@ void play_enter(void) {
   /* held piece is drawn semi-transparent like the "inactive" material */
   REG_BLDCNT = (1 << 6) | (0x2F << 8);     /* alpha blend, 2nd target: BG0-3 + backdrop + OBJ */
   REG_BLDALPHA = 12 | (7 << 8);
+  video_set_theme(mode);
+  REG_BGHOFS(2) = 0;
+  last_color = -1;
   tray[0].shape = tray[1].shape = tray[2].shape = 0xFF;
   for (int k = 0; k < 3; k++) tray[k] = new_slot(k);
   cursor = 0; holding = 0; blocks = 0; score = 0; new_best = 0;
@@ -223,13 +288,14 @@ void play_enter(void) {
   for (int k = 0; k < BENCH; k++) { int b = phys_add_piece(1, k % 7, (k & 1) ? FX(0.3) : FX(-0.3), FX(1.5) + k * FX(3.0), 0); phys_bodies[b].flags |= BODY_SLEEP; }
   blocks = BENCH;
 #endif
-  snd_play_song(&song_classic);
+  snd_play_song(modes[mode].song);
 }
 
 static void game_over(void) {
   dbg_printf("GAME OVER blocks=%d", blocks);
   state = ST_OVER; over_t = 0; over_shown = 0; holding = 0;
-  if (blocks > save.best_blocks) { save.best_blocks = blocks; new_best = 1; }
+  if (blocks > save.best[mode]) { save.best[mode] = blocks; new_best = 1; }
+  if (mode == MODE_CLASSIC && blocks > save.best_blocks) save.best_blocks = blocks;
   if ((u32)score > save.best_score) save.best_score = score;
   save_write();
   snd_stop_song();
@@ -351,24 +417,24 @@ static void draw_world(void) {
         ObjAttr* o = oam_alloc(); if (!o) break;
         if (y < -8 || y > 160) { o->attr0 = ATTR0_HIDE; continue; }
         o->attr0 = ATTR0_Y(y); o->attr1 = ATTR1_X(x + i * 7) | ATTR1_SIZE_8;
-        o->attr2 = ATTR2_TILE(OBJ_TILE_FONT + b[i] - 32) | ATTR2_PRIO(0) | ATTR2_PAL(OBJPAL_UI);
+        o->attr2 = ATTR2_TILE(OBJ_TILE_FONT + b[i] - OBJ_FONT_FIRST) | ATTR2_PRIO(0) | ATTR2_PAL(OBJPAL_UI);
       }
   }
   /* held piece */
   if (holding) {
-    obj_affine_set(MTX_HELD, fx_cos(hangle), fx_sin(hangle), 256);
+    fx c = fx_cos(hangle), s = fx_sin(hangle);
+    obj_affine_set(MTX_HELD, c, s, 256);
     ObjAttr* o = oam_alloc();
     int pal = hcolliding ? OBJPAL_RED : tray[cursor].color;
-    put_affine(o, sx_of(hx), sy_of(hy), OBJ_TILE_PIECE(tray[cursor].shape), pal, MTX_HELD, 1, 1);
-    if (hangle == 0) { o->attr0 &= ~ATTR0_AFF; o->attr1 &= ~0x3E00; }   /* upright: plain sprite, cheaper per scanline */
+    put_piece(o, tray[cursor].shape, sx_of(hx), sy_of(hy), c, s, pal, hangle == 0 ? PLAIN_UP : MTX_HELD, 1, 1);
   }
   /* tray */
   for (int k = 0; k < 3; k++) {
     if (holding && k == cursor) continue;
     if (state == ST_OVER) continue;
     ObjAttr* o = oam_alloc();
-    put_affine(o, 28, 8 + 24 + k * 48, OBJ_TILE_PIECE(tray[k].shape), tray[k].color,
-               (k == cursor && state == ST_PLAY) ? MTX_TRAY_HI : MTX_TRAY, 0, 0);
+    put_piece(o, tray[k].shape, 28, 8 + 24 + k * 48, 0, 0, tray[k].color,
+              (k == cursor && state == ST_PLAY) ? MTX_TRAY_HI : MTX_TRAY, 0, 0);
   }
   /* bodies */
   for (int i = 0; i < phys_count; i++) {
@@ -382,25 +448,18 @@ static void draw_world(void) {
      * settled tower) use plain sprites, with flips for 180 degrees, so a busy row
      * doesn't run out and drop the last sprites. */
     int q = ((int)(((s64)b->a * 10430) >> 16) >> 7) & 511;
-    if (q == 0 || q == 256) {
-      int x = sx - 32, y = sy - 32;
-      if (x <= -64 || x >= 240 || y <= -64 || y >= 160) { o->attr0 = ATTR0_HIDE; continue; }
-      o->attr0 = ATTR0_Y(y) | ATTR0_SQUARE;
-      o->attr1 = ATTR1_X(x) | ATTR1_SIZE_64 | (q ? ATTR1_HFLIP | ATTR1_VFLIP : 0);
-      o->attr2 = ATTR2_TILE(OBJ_TILE_PIECE(b->shape)) | ATTR2_PRIO(2) | ATTR2_PAL(b->color);
-      continue;
-    }
-    put_affine(o, sx, sy, OBJ_TILE_PIECE(b->shape), b->color, mtx_for_angle(b->c, b->s, b->a), 2, 0);
+    if (q == 0 || q == 256) put_piece(o, b->shape, sx, sy, q ? -FX_ONE : FX_ONE, 0, b->color, q ? PLAIN_DOWN : PLAIN_UP, 2, 0);
+    else put_piece(o, b->shape, sx, sy, b->c, b->s, b->color, mtx_for_angle(b->c, b->s, b->a), 2, 0);
   }
   /* base slab */
   int by = sy_of(0);
   for (int h = 0; h < 2; h++) {
     ObjAttr* o = oam_alloc(); if (!o) break;
     if (by >= 160) { o->attr0 = ATTR0_HIDE; continue; }
-    o->attr0 = ATTR0_Y(by) | ATTR0_WIDE; o->attr1 = ATTR1_X(SCREEN_CX - 64 + h * 64) | ATTR1_SIZE_64;
-    o->attr2 = ATTR2_TILE(OBJ_TILE_BASE + h * 32) | ATTR2_PRIO(2) | ATTR2_PAL(OBJPAL_BASE);
+    o->attr0 = ATTR0_Y(by) | ATTR0_WIDE; o->attr1 = ATTR1_X(SCREEN_CX - 64 + h * 64) | ATTR1_SIZE_64 | (h ? ATTR1_HFLIP : 0);
+    o->attr2 = ATTR2_TILE(OBJ_TILE_BASE) | ATTR2_PRIO(2) | ATTR2_PAL(OBJPAL_BASE);
   }
-  REG_BGVOFS(2) = (u16)(-(int)(((s64)cam_y * PX_PER_CELL) >> 18));
+  layer_scroll(cam_y);
 }
 
 static void over_update(void) {

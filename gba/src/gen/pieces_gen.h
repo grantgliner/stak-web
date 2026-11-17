@@ -2,19 +2,24 @@
 #pragma once
 #include "../gba.h"
 
-#define PIECE_COUNT 12
-#define PIECE_MAX_PARTS 4
+#define PIECE_COUNT 16
+#define PIECE_CLASSIC_COUNT 12
+#define PIECE_MAX_PARTS 5
 #define PIECE_MAX_VERTS 4
+#define PIECE_TILES 976          /* 4bpp OBJ tiles for all the sprites */
 
+/* n = 1: a circle, centre v[0], radius nrm[0][0] */
 typedef struct { u8 n; s32 v[PIECE_MAX_VERTS][2]; s32 nrm[PIECE_MAX_VERTS][2]; } PiecePart;
 typedef struct {
   const char* name;
   s32 mass, inertia;      /* Q16, cells^2 / cells^4 */
   s32 radius;             /* Q16 bounding radius from COM */
   s32 top, bottom;        /* Q16 extent above/below COM at angle 0 */
+  s32 sox, soy;           /* Q16 sprite centre relative to the COM at angle 0 */
+  u16 tile; u8 small;     /* first OBJ tile; 32x32 sprite instead of 64x64 */
   u8 nparts;
   PiecePart parts[PIECE_MAX_PARTS];
 } PieceDef;
 
 extern const PieceDef piece_defs[PIECE_COUNT];
-extern const u32 piece_tiles[PIECE_COUNT][512];
+extern const u32 piece_tiles[PIECE_TILES * 8];

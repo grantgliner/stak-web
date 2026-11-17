@@ -2,8 +2,8 @@
  *
  * Units: 1 cell = 0.025 m = 12 px. Q16.16 fixed point throughout.
  * Sequential-impulse solver (Box2D-lite style) with warm starting, convex
- * polygon parts (SAT + clipping), and island sleeping so a settled tower
- * costs almost nothing.
+ * polygon parts (SAT + clipping) and circle parts (with rolling resistance),
+ * and island sleeping so a settled tower costs almost nothing.
  */
 #pragma once
 #include "gba.h"
@@ -20,7 +20,7 @@ INLINE fx fxcross(V2 a, V2 b) { return (fx)(((s64)a.x * b.y - (s64)a.y * b.x + 0
 INLINE fx fxdot(V2 a, V2 b) { return (fx)(((s64)a.x * b.x + (s64)a.y * b.y + 0x8000) >> 16); }
 
 #define MAX_BODIES 128
-#define MAX_PARTS 4
+#define MAX_PARTS 5
 #define MAX_VERTS 4             /* parts are triangles or quads (tools/gen_pieces.py checks) */
 
 #define BODY_USED   1
@@ -28,6 +28,8 @@ INLINE fx fxdot(V2 a, V2 b) { return (fx)(((s64)a.x * b.x + (s64)a.y * b.y + 0x8
 #define BODY_SLEEP  4
 #define BODY_NEW    8          /* added while a step was running: joins at the next one */
 
+/* a convex part: n vertices (CCW) with outward edge normals; n = 1 is a circle,
+   centre v[0], radius nrm[0].x */
 typedef struct { u8 n; V2 v[MAX_VERTS]; V2 nrm[MAX_VERTS]; V2 bmin, bmax; } Poly;
 
 /* geometry + state (EWRAM) */
