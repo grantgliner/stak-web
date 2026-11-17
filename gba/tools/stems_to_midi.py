@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Turn audio/menu.m4a and audio/classic.m4a into clean 4-track MIDI files
-(music/<song>.mid: lead, harmony, bass, drums) for tools/gen_music.py.
+"""Transcribe audio/menu.m4a and audio/classic.m4a into 4-track MIDI files
+(music/transcribed/<song>.mid: lead, harmony, bass, drums). These are a
+reference for the key, tempo and motifs; the game's tunes are arranged in
+tools/compose.py.
 
 Pipeline:
   1. Demucs (htdemucs_6s) splits each song into stems.
@@ -20,7 +22,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..')
 AUDIO = os.path.join(ROOT, '..', 'audio')
-OUT = os.path.join(ROOT, 'music')
+OUT = os.path.join(ROOT, 'music', 'transcribed')
 
 # name, bpm, time of the first 16th-note grid line (s), grid cell of the first
 # downbeat. Tempo and grid offset were fitted to note and drum onsets.

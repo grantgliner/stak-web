@@ -45,10 +45,12 @@ The generated assets in `src/gen/` are committed, so Python is only needed if yo
   - game over when a block falls below the base or more than 0.45 m to either side,
   - the same game-over messages.
 - **Sound** is PSG only. Music uses channels 2, 3 and 4 plus a harmony line on channel 1. Sound effects take over channel 1.
-  - The menu and classic tunes come from `audio/menu.m4a` and `audio/classic.m4a` in two steps:
-    1. `tools/stems_to_midi.py` splits each song into stems with Demucs and converts the bass, guitar and synth stems to notes with Spotify's basic-pitch. Drum hits come from onsets in the drum stem. Everything snaps to the song's 16th-note grid and is cut down to one note at a time per part. The result is `music/menu.mid` and `music/classic.mid`, with lead, harmony, bass and drum tracks. This step needs demucs, torch, basic-pitch and librosa, and only has to run again if the songs change.
-    2. `tools/gen_music.py` (part of `make assets`) turns those MIDI files into note data. The whole song loops.
-  - You can edit the MIDI files by hand in any DAW and run `make assets` again.
+  - The menu and classic tunes are original arrangements for the PSG, written in `tools/compose.py`. They borrow the key, tempo, chord colour and motif shapes of `audio/menu.m4a` and `audio/classic.m4a`:
+    - menu: C major at about 109 bpm, with the original's borrowed Bb and Eb chords;
+    - classic: E dorian at 166 bpm, over Em, C, D and A.
+  - The melodies are written out bar by bar. Harmony (broken chords), bass and drums are generated from each song's chord chart.
+  - Running `compose.py` writes `music/menu.mid` and `music/classic.mid`, with lead, harmony, bass and drum tracks. `tools/gen_music.py` (part of `make assets`) turns those into note data, and the whole song loops. Per-song voice settings live in `gen_music.py`: duty, envelope, vibrato and bass wave.
+  - `tools/stems_to_midi.py` transcribes the original audio (Demucs stems, then basic-pitch) into `music/transcribed/` for reference. It needs demucs, torch, basic-pitch and librosa.
 - **Saves:** the best score goes to SRAM.
 
 ## Testing

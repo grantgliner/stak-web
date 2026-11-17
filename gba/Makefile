@@ -45,6 +45,7 @@ assets:
 	python3 tools/gen_tables.py
 	python3 tools/gen_pieces.py
 	python3 tools/gen_gfx.py
+	python3 tools/compose.py
 	python3 tools/gen_music.py
 
 -include $(OBJS:.o=.d)

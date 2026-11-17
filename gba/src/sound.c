@@ -32,17 +32,25 @@ typedef struct { const u8* d; u16 len, pos; s16 t; } Voice;
 static const Song* song;
 static Voice v_lead, v_harm, v_bass, v_drum;
 static int frame_ctr;
+static int lead_note, lead_age;   /* for vibrato */
 
-static const u32 wave_bass[4] = { 0xEFCDAB89, 0x67452301, 0x10325476, 0x98BADCFE }; /* triangle */
+static const u32 wave_bass[2][4] = {
+  { 0xEFCDAB89, 0x67452301, 0x10325476, 0x98BADCFE },   /* triangle */
+  { 0x34231201, 0x88776645, 0xCDBCAB99, 0x20B6EFDE },   /* soft saw: ramp up, quick rounded drop */
+};
+
+static void load_wave(int w) {
+  REG_SOUND3CNT_L = 0x0000;          /* select bank so we write bank 1 */
+  for (int i = 0; i < 4; i++) WAVE_RAM[i] = wave_bass[w][i];
+  REG_SOUND3CNT_L = 0x0040;          /* play bank 1, 32 samples, disabled */
+}
 
 void snd_init(void) {
   REG_SOUNDCNT_X = 0x80;
   REG_SOUNDCNT_L = 0xFF77;
   REG_SOUNDCNT_H = 0x0002;
   REG_SOUND1CNT_L = 0x0008;
-  REG_SOUND3CNT_L = 0x0000;          /* select bank so we write bank 1 */
-  for (int i = 0; i < 4; i++) WAVE_RAM[i] = wave_bass[i];
-  REG_SOUND3CNT_L = 0x0040;          /* play bank 1, 32 samples, disabled */
+  load_wave(0);
   song = 0; sfx_cur = 0;
 }
 
@@ -50,6 +58,8 @@ static void voice_start(Voice* v, const u8* d, u16 len) { v->d = d; v->len = len
 
 void snd_play_song(const Song* s) {
   song = s; frame_ctr = 0;
+  load_wave(s->bass_wave);
+  lead_note = 0;
   voice_start(&v_lead, s->lead, s->lead_len);
   voice_start(&v_harm, s->harm, s->harm_len);
   voice_start(&v_bass, s->bass, s->bass_len);
@@ -87,6 +97,7 @@ static void drum(int k) {
     case 1: REG_SOUND4CNT_L = 0xC100 | 0x00; REG_SOUND4CNT_H = 0x8000 | 0x61; break;   /* kick */
     case 2: REG_SOUND4CNT_L = 0xA200; REG_SOUND4CNT_H = 0x8000 | 0x32; break;          /* snare */
     case 3: REG_SOUND4CNT_L = 0x5100; REG_SOUND4CNT_H = 0x8000 | 0x08 | 0x10; break;   /* hat (7-bit) */
+    case 4: REG_SOUND4CNT_L = 0x5300; REG_SOUND4CNT_H = 0x8000 | 0x10; break;          /* open hat */
   }
 }
 
@@ -116,11 +127,19 @@ void snd_tick(void) {
   frame_ctr = 0;
   int n;
   if ((n = voice_step(&v_lead)) >= 0) {
+    lead_note = n; lead_age = 0;
     if (n) { REG_SOUND2CNT_L = song->lead_duty << 6 | song->lead_env << 8; REG_SOUND2CNT_H = 0x8000 | sq_rate(n); }
     else { REG_SOUND2CNT_L = 0; REG_SOUND2CNT_H = 0x8000; }
+  } else if (lead_note && song->vib_depth && ++lead_age > song->vib_delay) {
+    /* delayed vibrato on held notes: a 12-frame triangle LFO, written without
+       restarting the note so the envelope carries on */
+    static const s8 lfo[12] = { 0, 2, 4, 6, 4, 2, 0, -2, -4, -6, -4, -2 };
+    int r0 = sq_rate(lead_note), r1 = sq_rate(lead_note + 1);
+    int off = (r1 - r0) * song->vib_depth * lfo[lead_age % 12] / (16 * 6);
+    REG_SOUND2CNT_H = r0 + off;
   }
   if ((n = voice_step(&v_harm)) >= 0 && !sfx_cur) {
-    if (n) { REG_SOUND1CNT_L = 0x0008; REG_SOUND1CNT_H = (2 << 6) | 0x5000 | 0x0300; REG_SOUND1CNT_X = 0x8000 | sq_rate(n); }
+    if (n) { REG_SOUND1CNT_L = 0x0008; REG_SOUND1CNT_H = song->harm_duty << 6 | song->harm_env << 8; REG_SOUND1CNT_X = 0x8000 | sq_rate(n); }
     else { REG_SOUND1CNT_H = 0; REG_SOUND1CNT_X = 0x8000; }
   }
   if ((n = voice_step(&v_bass)) >= 0) {
