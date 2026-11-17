@@ -56,7 +56,12 @@ void snd_init(void) {
 
 static void voice_start(Voice* v, const u8* d, u16 len) { v->d = d; v->len = len; v->pos = 0; v->t = 0; }
 
+/* snd_tick runs in the VBlank interrupt, so the entry points below keep it out
+   while they change what it reads */
+static inline u16 irq_hold(void) { u16 ime = REG_IME; REG_IME = 0; return ime; }
+
 void snd_play_song(const Song* s) {
+  u16 ime = irq_hold();
   song = s; frame_ctr = 0;
   load_wave(s->bass_wave);
   lead_note = 0;
@@ -64,16 +69,19 @@ void snd_play_song(const Song* s) {
   voice_start(&v_harm, s->harm, s->harm_len);
   voice_start(&v_bass, s->bass, s->bass_len);
   voice_start(&v_drum, s->drums, s->drums_len);
+  REG_IME = ime;
 }
 void snd_stop_song(void) {
+  u16 ime = irq_hold();
   song = 0;
   REG_SOUND2CNT_L = 0; REG_SOUND2CNT_H = 0x8000;
   REG_SOUND3CNT_L = 0x0040;
   if (!noise_busy) { REG_SOUND4CNT_L = 0; REG_SOUND4CNT_H = 0x8000; }
   if (!sfx_cur) { REG_SOUND1CNT_H = 0; REG_SOUND1CNT_X = 0x8000; }
+  REG_IME = ime;
 }
 
-void snd_sfx(int id) { sfx_cur = sfx_tab[id]; sfx_t = 0; }
+void snd_sfx(int id) { u16 ime = irq_hold(); sfx_cur = sfx_tab[id]; sfx_t = 0; REG_IME = ime; }
 
 static void sfx_apply(const SfxStep* s) {
   if (s->flags & 0x10) {

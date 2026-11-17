@@ -4,7 +4,7 @@
 
 #define PIECE_COUNT 12
 #define PIECE_MAX_PARTS 4
-#define PIECE_MAX_VERTS 8
+#define PIECE_MAX_VERTS 4
 
 typedef struct { u8 n; s32 v[PIECE_MAX_VERTS][2]; s32 nrm[PIECE_MAX_VERTS][2]; } PiecePart;
 typedef struct {

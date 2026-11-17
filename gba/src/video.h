@@ -36,6 +36,8 @@ extern int txt_dirty;
 
 void video_init(void);
 void video_vsync(int sky_offset);    /* wait for vblank and push shadows */
+extern volatile u16 vblank_tick;      /* timer 2 (64-cycle ticks) when the last VBlank began */
+#define FRAME_TICKS 4389              /* 280896 cycles */
 void oam_clear(void);
 ObjAttr* oam_alloc(void);           /* next free OAM entry (or NULL) */
 void oam_reset_alloc(int first);

@@ -1,4 +1,5 @@
 #include "video.h"
+#include "sound.h"
 #include "gen/gfx_gen.h"
 #include "gen/pieces_gen.h"
 
@@ -51,14 +52,19 @@ void video_init(void) {
  * misses a VBlank and a DMA left running would paint the next frame from the
  * wrong part of the gradient, which flashes. */
 static volatile int sky_off = 1024 - 161;
+volatile u16 vblank_tick;
 
+/* Music and sound effects tick here too, so they keep time while the main loop
+ * is busy. */
 void vblank_isr(void) {
+  vblank_tick = REG_TM2CNT_L;
   int o = sky_off;
   REG_DMA0CNT = 0;
   PAL_BG[0] = sky_ram[o];
   REG_DMA0SAD = (u32)&sky_ram[o + 1];
   REG_DMA0DAD = (u32)PAL_BG;
   REG_DMA0CNT = DMA_ENABLE | DMA_HBLANK | DMA_REPEAT | DMA_DST_FIXED | 1;
+  snd_tick();
 }
 
 void video_vsync(int sky_offset) {

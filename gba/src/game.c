@@ -289,7 +289,9 @@ static void play_input(void) {
   if (keys_down & KEY_B) { holding = 0; snd_sfx(SFX_PUTBACK); return; }
   if ((keys_down & KEY_A) && hold_spawn_t > 1) {
     if (hcolliding || hrot_t < ROT_FRAMES) { snd_sfx(SFX_ERROR); return; }
-    last_placed = phys_add_piece(tray[cursor].shape, tray[cursor].color, hx, hy, hangle_to);
+    int b = phys_add_piece(tray[cursor].shape, tray[cursor].color, hx, hy, hangle_to);
+    if (b < 0) { snd_sfx(SFX_ERROR); return; }      /* every body slot is in use */
+    last_placed = b;
     blocks++;
     score += 250 * blocks;
     pop_t = 50; pop_val = 250 * blocks; pop_x = hx; pop_y = hy + piece_defs[tray[cursor].shape].top;
@@ -305,6 +307,16 @@ static void check_fall(void) {
     Body* b = &phys_bodies[i];
     if ((b->flags & (BODY_USED | BODY_STATIC)) != BODY_USED) continue;
     if (b->p.y < FALL_Y || b->p.x > FALL_X || b->p.x < -FALL_X) { game_over(); return; }
+  }
+}
+
+/* after a game over, blocks that fell past the base keep falling: drop them
+   once they are well out of sight so they stop costing physics time */
+static void drop_fallen(void) {
+  if (phys_busy()) return;
+  for (int i = 0; i < phys_count; i++) {
+    Body* b = &phys_bodies[i];
+    if ((b->flags & (BODY_USED | BODY_STATIC)) == BODY_USED && b->p.y < FALL_Y - FX(40.0)) phys_remove(i);
   }
 }
 
@@ -423,6 +435,25 @@ static void pause_update(void) {
 }
 
 /* ------------------------------------------------------------------ main loop */
+/* Physics gets whatever is left of the frame once the game has drawn it. A step
+   that does not fit carries on in the next frame (bodies keep their last
+   positions until it ends), so a big wobbly tower runs in slow motion instead of
+   dropping frames, and the controls, camera and music stay at 60 fps. At most one
+   step starts per frame, so the simulation never runs faster than real time. */
+#define PHYS_MARGIN 160      /* ticks kept back for estimate error and the loop's own tail */
+static void run_physics(void) {
+  u16 deadline = (u16)(vblank_tick + FRAME_TICKS - PHYS_MARGIN);
+  int r = phys_run(deadline, 1);
+  /* finished the step carried over from the last frame: start this frame's if there is room */
+  if ((r & (PHYS_STARTED | PHYS_DONE)) == PHYS_DONE && (s16)(deadline - REG_TM2CNT_L) > 600) phys_run(deadline, 1);
+#ifdef PROFILE
+  if (r & PHYS_DONE) {
+    static u32 last_done; if (frame - last_done > 1) dbg_printf("step took %lu frames: bodies=%d awake=%d pts=%d", frame - last_done, phys_count, phys_awake, phys_points);
+    last_done = frame;
+  }
+#endif
+}
+
 int main(void) {
   REG_WAITCNT = 0x4317;   /* faster ROM waitstates + prefetch */
   REG_TM2CNT_H = 0; REG_TM2CNT_L = 0; REG_TM2CNT_H = 0x80 | 1;  /* 64-cycle ticks for profiling */
@@ -436,7 +467,6 @@ int main(void) {
 #ifdef PROFILE
     u16 f_start = REG_TM2CNT_L;
 #endif
-    snd_tick();
     read_keys();
     frame++;
     switch (state) {
@@ -447,31 +477,26 @@ int main(void) {
       case ST_PLAY:
       case ST_OVER: {
         if (state == ST_PLAY) play_input();
-        u16 t0 = REG_VCOUNT;
-        phys_step();
-        u16 t1 = REG_VCOUNT;
         if (state == ST_PLAY) check_fall();
-        else over_update();
+        else if (state == ST_OVER) { over_update(); drop_fallen(); }
         if (state == ST_TITLE) break;
         update_camera();
         draw_world();
-#ifdef PROFILE   /* mGBA debug log: physics cost per section, in 64-cycle ticks */
-        { extern u32 phys_prof[8]; if (phys_points) dbg_printf("prof %d %d %d %d %d %d pts=%d", (u16)(phys_prof[1]-phys_prof[0]), (u16)(phys_prof[2]-phys_prof[1]), (u16)(phys_prof[3]-phys_prof[2]), (u16)(phys_prof[4]-phys_prof[3]), (u16)(phys_prof[5]-phys_prof[4]), (u16)(phys_prof[6]-phys_prof[5]), phys_points); }
-        if ((frame & 63) == 0) dbg_printf("f%lu bodies=%d awake=%d pts=%d phys_lines=%d", frame, phys_count, phys_awake, phys_points, (t1 - t0 + 228) % 228);
-#else
-        (void)t0; (void)t1;
-#endif
         sky = 1024 - 161 - (int)(((s64)cam_y * PX_PER_CELL) >> 17);
+#ifdef PROFILE   /* the game's own share of the frame, before physics gets the rest */
+        { static u32 sum, n; static u16 mx; u16 gt = (u16)(REG_TM2CNT_L - vblank_tick); sum += gt; n++; if (gt > mx) mx = gt;
+          if (n == 256) { dbg_printf("game work: avg %lu max %u ticks (from VBlank), bodies %d", sum / n, mx, phys_count); sum = n = 0; mx = 0; } }
+#endif
+        if (state != ST_PAUSE) run_physics();
         break;
       }
       case ST_PAUSE:
         pause_update();
         break;
     }
-#ifdef PROFILE   /* a frame has 4389 64-cycle ticks; log the ones that come close */
-    { u16 ft = (u16)(REG_TM2CNT_L - f_start); extern u32 phys_prof[8];
-      if (ft > 3000) dbg_printf("slow f%lu ticks=%u bodies=%d awake=%d pts=%d phys=%u narrow=%u solve=%u", frame, ft, phys_count, phys_awake, phys_points,
-                                (u16)(phys_prof[6] - phys_prof[0]), (u16)(phys_prof[3] - phys_prof[2]), (u16)(phys_prof[5] - phys_prof[4])); }
+#ifdef PROFILE   /* frames that ran past the next VBlank (4389 ticks) */
+    { u16 ft = (u16)(REG_TM2CNT_L - f_start);
+      if (ft > FRAME_TICKS - 120) dbg_printf("late f%lu ticks=%u bodies=%d awake=%d pts=%d", frame, ft, phys_count, phys_awake, phys_points); }
 #endif
   }
 }

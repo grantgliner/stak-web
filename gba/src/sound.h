@@ -22,4 +22,4 @@ void snd_init(void);
 void snd_play_song(const Song* s);
 void snd_stop_song(void);
 void snd_sfx(int id);
-void snd_tick(void);     /* call once per frame */
+void snd_tick(void);     /* once per frame, from the VBlank interrupt (video.c) */

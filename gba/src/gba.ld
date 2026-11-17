@@ -9,7 +9,7 @@ MEMORY {
 }
 
 __sp_irq = 0x03007FA0;
-__sp_usr = 0x03007F00;
+__sp_usr = 0x03007E00;   /* 416 B of IRQ stack: the VBlank interrupt runs the music */
 
 SECTIONS {
   .crt0 : { KEEP(*(.crt0)) } > rom
@@ -33,3 +33,5 @@ SECTIONS {
   end = __sbss_end; _end = __sbss_end;
   /DISCARD/ : { *(.ARM.attributes) *(.comment) }
 }
+/* the deepest physics call chain (narrow phase) needs about 1.1 KB of stack */
+ASSERT(__bss_end + 1280 <= __sp_usr, "IWRAM: not enough room left for the stack")
