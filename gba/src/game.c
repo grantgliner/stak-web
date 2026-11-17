@@ -402,8 +402,8 @@ static void pause_update(void) {
 
 /* ------------------------------------------------------------------ main loop */
 int main(void) {
-  REG_WAITCNT = 0x4317;
-  REG_TM2CNT_H = 0; REG_TM2CNT_L = 0; REG_TM2CNT_H = 0x80 | 1;  /* 64-cycle ticks for profiling */   /* faster ROM waitstates + prefetch */
+  REG_WAITCNT = 0x4317;   /* faster ROM waitstates + prefetch */
+  REG_TM2CNT_H = 0; REG_TM2CNT_L = 0; REG_TM2CNT_H = 0x80 | 1;  /* 64-cycle ticks for profiling */
   video_init();
   snd_init();
   save_load();
@@ -430,8 +430,12 @@ int main(void) {
         if (state == ST_TITLE) break;
         update_camera();
         draw_world();
+#ifdef PROFILE   /* mGBA debug log: physics cost per section, in 64-cycle ticks */
         { extern u32 phys_prof[8]; if (phys_points) dbg_printf("prof %d %d %d %d %d %d pts=%d", (u16)(phys_prof[1]-phys_prof[0]), (u16)(phys_prof[2]-phys_prof[1]), (u16)(phys_prof[3]-phys_prof[2]), (u16)(phys_prof[4]-phys_prof[3]), (u16)(phys_prof[5]-phys_prof[4]), (u16)(phys_prof[6]-phys_prof[5]), phys_points); }
         if ((frame & 63) == 0) dbg_printf("f%lu bodies=%d awake=%d pts=%d phys_lines=%d", frame, phys_count, phys_awake, phys_points, (t1 - t0 + 228) % 228);
+#else
+        (void)t0; (void)t1;
+#endif
         sky = 1024 - 161 - (int)(((s64)cam_y * PX_PER_CELL) >> 17);
         break;
       }

@@ -17,7 +17,7 @@ ARCH    := -mcpu=arm7tdmi -mtune=arm7tdmi -mthumb-interwork
 CFLAGS  := $(ARCH) -mthumb -O2 -Wall -Wno-misleading-indentation -ffunction-sections -fdata-sections -fno-strict-aliasing -std=gnu11
 LDFLAGS := $(ARCH) -mthumb -nostartfiles -T src/gba.ld -Wl,--gc-sections -specs=nano.specs -specs=nosys.specs -Wl,-Map,$(BUILD)/$(TARGET).map
 
-.PHONY: all clean assets run test
+.PHONY: all clean assets run test bench
 
 all: $(TARGET).gba
 
@@ -45,13 +45,19 @@ assets:
 	python3 tools/gen_tables.py
 	python3 tools/gen_pieces.py
 	python3 tools/gen_gfx.py
+	python3 tools/gen_music.py
 
 -include $(OBJS:.o=.d)
 
 clean:
-	rm -rf $(BUILD) $(TARGET).gba
+	rm -rf $(BUILD) build_bench $(TARGET).gba bench.gba
+
+# Profiling build: a settled 16-block tower, per-section physics cost in the mGBA log
+bench:
+	$(MAKE) BUILD=build_bench TARGET=bench CFLAGS="$(CFLAGS) -DBENCH=16 -DPROFILE"
 
 # Headless smoke test with libmgba (Ubuntu: apt install libmgba-dev)
 test: $(TARGET).gba
+	@mkdir -p $(BUILD)/shots
 	$(MAKE) -C tools/harness
 	tools/harness/harness $(TARGET).gba tests/smoke.txt
