@@ -7,9 +7,13 @@ _Static_assert(PIECE_MAX_PARTS <= MAX_PARTS, "pieces have more parts than physic
 
 #ifdef HOST
 #define ROM_CODE
+#define ROM_ARM
 #else
 /* cold code: Thumb in ROM (ARM code would fetch 32 bits over the 16-bit cart bus) */
 #define ROM_CODE __attribute__((section(".romcode"), noinline, target("thumb")))
+/* ARM code in ROM, for the arcade's multiply-heavy loops: Thumb has no 64-bit
+   multiply, so every fxmul there would be a library call */
+#define ROM_ARM __attribute__((section(".romcode"), noinline))
 #endif
 
 /* ---- tuning ----------------------------------------------------------
@@ -38,6 +42,7 @@ int phys_iters = 1;
 #define H         (FX_ONE / (60 * SUBSTEPS))
 #define INV_H     ((60 * SUBSTEPS) * FX_ONE)
 #define GRAVITY   FX(392.4)        /* 9.81 m/s^2 in cells/s^2 (1 cell = 2.5 cm) */
+static fx gravity = GRAVITY, grav_h = (fx)(((s64)GRAVITY * H + 0x8000) >> 16);   /* arcade: 0.85 g */
 #define MAX_BIAS_VEL FX(60.0)
 #define MAX_VEL   FX(300.0)        /* cells/s; a block dropped from 100 cells up lands at ~280 */
 #define MAX_ANG_VEL FX(40.0)       /* rad/s */
@@ -48,6 +53,7 @@ int phys_iters = 1;
 #define LINEAR_SLOP FX(0.02)
 #define MARGIN    FX(0.04)         /* speculative contact distance */
 #define REST      FX(0.25)         /* restitution (Vision Pro classic) */
+static fx friction = FX(0.8), restitution = REST;
 #define REST_VEL  FX(12.0)         /* only bounce above this approach speed */
 #define FRICTION  FX(0.8)
 #define FRICTION_BASE FX(0.9)
@@ -131,12 +137,22 @@ static fx body_invM[MAX_BODIES] EWRAM_BSS, body_invI[MAX_BODIES] EWRAM_BSS;
    angular impulse on the relative spin, at most lim x the normal impulse */
 typedef struct { fx lim, k, ia, ib, P; } RollC;
 static RollC roll_c[MAX_ARB] EWRAM_BSS;
+/* arcade: per-body shapes, masses, welds, magnets */
+static PhysShape var_shape[MAX_BODIES] EWRAM_BSS;
+static fx body_mass[MAX_BODIES] EWRAM_BSS;
+static u8 wgroup[MAX_BODIES] EWRAM_BSS;          /* weld group (0: none); bodies in one don't collide */
+s8 phys_charge[MAX_BODIES] EWRAM_BSS;
+void (*phys_after_step)(void);
 
 static u8 uf_parent[MAX_BODIES] EWRAM_BSS;
 static u8 wake_req[MAX_BODIES] EWRAM_BSS, wr_list[MAX_BODIES] EWRAM_BSS;   /* wake requests (phys_wake, impacts) */
 static int wr_n;
 static void request_wake(int i) { if (!wake_req[i]) { wake_req[i] = 1; wr_list[wr_n++] = i; } }
 static u8 tip_woke[MAX_BODIES] EWRAM_BSS, tip_ok[MAX_BODIES] EWRAM_BSS;   /* see tip_note_sleep */
+static int nwelds;
+static u8 hook_due EWRAM_BSS, mag_on EWRAM_BSS, arc_stage EWRAM_BSS;   /* the after-step hook is due; magnets acted last step */
+ROM_CODE static int weld_wake(void);
+ROM_CODE static void weld_islands(void);
 
 /* ---- math ------------------------------------------------------------ */
 fx fx_sin(fx a) {
@@ -172,11 +188,10 @@ static inline u32 recip(fx k) {        /* 1/k in Q16, k > 0 (Q16) */
 }
 
 /* ---- geometry -------------------------------------------------------- */
-static void transform_parts(int shape, fx px, fx py, fx c, fx s, Poly* out, V2* bmin, V2* bmax) {
-  const PieceDef* d = &piece_defs[shape];
+static void transform_parts(const PiecePart* parts, int nparts, fx px, fx py, fx c, fx s, Poly* out, V2* bmin, V2* bmax) {
   fx minx = 0x7FFFFFFF, miny = 0x7FFFFFFF, maxx = -0x7FFFFFFF, maxy = -0x7FFFFFFF;
-  for (int p = 0; p < d->nparts; p++) {
-    const PiecePart* pp = &d->parts[p];
+  for (int p = 0; p < nparts; p++) {
+    const PiecePart* pp = &parts[p];
     Poly* w = &out[p];
     w->n = pp->n;
     fx pminx = 0x7FFFFFFF, pminy = 0x7FFFFFFF, pmaxx = -0x7FFFFFFF, pmaxy = -0x7FFFFFFF;
@@ -207,13 +222,20 @@ static void transform_parts(int shape, fx px, fx py, fx c, fx s, Poly* out, V2* 
 
 ROM_CODE int phys_piece_world(int shape, fx x, fx y, fx angle, Poly* polys) {
   V2 a, b;
-  transform_parts(shape, x, y, fx_cos(angle), fx_sin(angle), polys, &a, &b);
-  return piece_defs[shape].nparts;
+  const PieceDef* d = &piece_defs[shape];
+  transform_parts(d->parts, d->nparts, x, y, fx_cos(angle), fx_sin(angle), polys, &a, &b);
+  return d->nparts;
+}
+ROM_CODE int phys_shape_world(const PhysShape* ps, fx x, fx y, fx angle, Poly* polys) {
+  V2 a, b;
+  transform_parts(ps->parts, ps->nparts, x, y, fx_cos(angle), fx_sin(angle), polys, &a, &b);
+  return ps->nparts;
 }
 
 static void update_body(Body* b) {
   b->c = fx_cos(b->a); b->s = fx_sin(b->a);
-  transform_parts(b->shape, b->p.x, b->p.y, b->c, b->s, b->wp, &b->bmin, &b->bmax);
+  const PiecePart* parts = b->var ? var_shape[b - phys_bodies].parts : piece_defs[b->shape].parts;
+  transform_parts(parts, b->nparts, b->p.x, b->p.y, b->c, b->s, b->wp, &b->bmin, &b->bmax);
 }
 
 /* max over edges of A of min separation of B's verts along that edge normal */
@@ -405,7 +427,9 @@ static u8 ph;                      /* step phase, PH_IDLE between steps */
 static u8 bp_dirty;                /* bodies were added or removed */
 ROM_CODE static void body_reset_scratch(int i);
 ROM_CODE void phys_init(void) {
-  for (int i = 0; i < MAX_BODIES; i++) { phys_bodies[i].flags = 0; bp_in[i] = 0; wake_req[i] = 0; }
+  for (int i = 0; i < MAX_BODIES; i++) { phys_bodies[i].flags = 0; bp_in[i] = 0; wake_req[i] = 0; phys_charge[i] = 0; wgroup[i] = 0; }
+  nwelds = 0; hook_due = 0; mag_on = 0; arc_stage = 0; phys_after_step = 0;
+  phys_set_params(GRAVITY, FX(0.8), REST);
   bp_n = 0; ph = 0; wr_n = 0; bp_dirty = 1;
   phys_count = 0; narb = nprev = ncarried = 0; arb_rescan = 0; npts = 0; nman = 0; nman_iw = npts_iw = 0;
 }
@@ -422,7 +446,7 @@ ROM_CODE int phys_add_static_box(fx cx, fx cy, fx hw, fx hh) {
   int i = alloc_body(); if (i < 0) return -1;
   bp_dirty = 1;
   Body* b = &phys_bodies[i];
-  b->flags = BODY_USED | BODY_STATIC; b->shape = 0xFF; b->nparts = 1;
+  b->flags = BODY_USED | BODY_STATIC; b->shape = 0xFF; b->nparts = 1; b->var = 0;
   b->p.x = cx; b->p.y = cy; b->a = 0; b->c = FX_ONE; b->s = 0;
   Poly* p = &b->wp[0]; p->n = 4;
   p->v[0] = (V2){ cx - hw, cy - hh }; p->v[1] = (V2){ cx + hw, cy - hh };
@@ -440,15 +464,30 @@ ROM_CODE int phys_add_piece(int shape, int color, fx x, fx y, fx angle) {
   bp_dirty = 1;
   Body* b = &phys_bodies[i];
   const PieceDef* d = &piece_defs[shape];
-  b->flags = ph ? BODY_USED | BODY_NEW : BODY_USED; b->shape = shape; b->color = color; b->nparts = d->nparts;
+  b->flags = ph ? BODY_USED | BODY_NEW : BODY_USED; b->shape = shape; b->color = color; b->nparts = d->nparts; b->var = 0;
   b->p.x = x; b->p.y = y; b->a = angle; b->sleepTime = 0; b->frx = b->fry = b->fra = 0;
   tip_woke[i] = tip_ok[i] = 0;
   update_body(b);
   BodyVel* v = &phys_vel[i];
   v->vx = v->vy = v->w = 0; v->dpx = v->dpy = v->dq = 0;
-  body_invM[i] = recip(d->mass); body_invI[i] = recip(d->inertia);
+  body_invM[i] = recip(d->mass); body_invI[i] = recip(d->inertia); body_mass[i] = d->mass;
   body_reset_scratch(i);
   return i;
+}
+
+ROM_CODE int phys_add_shape(const PhysShape* ps, int color, fx x, fx y, fx angle) {
+  int i = phys_add_piece(ps->shape, color, x, y, angle);
+  if (i < 0) return i;
+  Body* b = &phys_bodies[i];
+  var_shape[i] = *ps; b->var = 1; b->nparts = ps->nparts;
+  update_body(b);
+  body_invM[i] = recip(ps->mass); body_invI[i] = recip(ps->inertia); body_mass[i] = ps->mass;
+  return i;
+}
+ROM_CODE const PhysShape* phys_body_shape(int i) { return phys_bodies[i].var ? &var_shape[i] : 0; }
+ROM_CODE fx phys_body_mass(int i) { return body_mass[i]; }
+ROM_CODE void phys_set_params(fx g, fx fr, fx rest) {
+  gravity = g; grav_h = fxmul(g, H); friction = fr; restitution = rest;
 }
 
 ROM_CODE int phys_overlaps(const Poly* polys, int n, fx tol) {
@@ -538,7 +577,7 @@ static SPt* add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbite
     rc->lim = fxmul(ROLL_RES, round_r); rc->ia = iiA; rc->ib = iiB; rc->k = recip(iiA + iiB); rc->P = 0;
   }
   mn->nx = nx; mn->ny = ny;
-  mn->fric = ((A->flags | B->flags) & BODY_STATIC) ? FRICTION_BASE : FRICTION;
+  mn->fric = ((A->flags | B->flags) & BODY_STATIC) ? FRICTION_BASE : friction;
   mn->anx = fxmul(imA, nx); mn->any = fxmul(imA, ny); mn->bnx = fxmul(imB, nx); mn->bny = fxmul(imB, ny);
   na->tm = 0;
   for (int k = 0; k < m->count; k++) {
@@ -750,7 +789,7 @@ static s64 wl_mx[MAX_BODIES] EWRAM_BSS;
 ROM_CODE static void wl_seed(Arbiter* r, int c, fx W) {
   fx nx = (fx)r->nx << 2, ny = (fx)r->ny << 2;
   if (r->up < 0) { nx = -nx; ny = -ny; }       /* normal from the lower body up */
-  fx pn = fxmul(W, ny), pt = fxmul(W, nx), lim = fxmul(FRICTION, pn);
+  fx pn = fxmul(W, ny), pt = fxmul(W, nx), lim = fxmul(friction, pn);
   if (pt > lim) pt = lim; else if (pt < -lim) pt = -lim;
   r->Pn[c] += pn; r->Pt[c] += r->up < 0 ? -pt : pt;
 }
@@ -783,7 +822,7 @@ ROM_CODE static void wake_loads(Arbiter* arbs, int narb, const u8* woke) {
   for (int i = 0; i < phys_count; i++) {
     Body* b = &phys_bodies[i];
     if ((b->flags & (BODY_USED | BODY_STATIC)) != BODY_USED) continue;
-    wl_load[i] = piece_defs[b->shape].mass; wl_mx[i] = (s64)wl_load[i] * b->p.x;
+    wl_load[i] = body_mass[i]; wl_mx[i] = (s64)wl_load[i] * b->p.x;
     if (!wl_rem[i]) wl_queue[qt++] = i;
   }
   while (qh < qt) {
@@ -813,7 +852,7 @@ ROM_CODE static void wake_loads(Arbiter* arbs, int narb, const u8* woke) {
         if (!rmax || r->cx[c] > rmax->cx[kmax]) { rmax = r; kmax = c; }
       }
     }
-    fx P = fxmul(load, fxmul(GRAVITY, H));     /* g*H first: load*g overflows Q16 for a tall column */
+    fx P = fxmul(load, grav_h);     /* g*H first: load*g overflows Q16 for a tall column */
     fx x0 = rmin->cx[kmin], x1 = rmax->cx[kmax], p1 = P / 2;
     if (x1 - x0 >= FX(0.05)) {
       fx t = (fx)(((s64)(xc - x0) * FX_ONE) / (x1 - x0));
@@ -829,7 +868,7 @@ ROM_CODE static void apply_restitution(SMan* m, int nm, SPt* s) {
     for (int k = 0; k < m->n; k++, s++) {
       if (s->vn0 > -REST_VEL || s->maxPn == 0) continue;
       BodyVel* va = &phys_vel[m->a]; BodyVel* vb = &phys_vel[m->b];
-      fx imp = -fxmul(s->mn, rel_vn(m, s, va, vb) + fxmul(REST, s->vn0));
+      fx imp = -fxmul(s->mn, rel_vn(m, s, va, vb) + fxmul(restitution, s->vn0));
       fx Pn0 = s->Pn, Pn = Pn0 + imp; if (Pn < 0) Pn = 0;
       s->Pn = Pn;
       APPLY_N(m, va, vb, Pn - Pn0, s->kna, s->knb);
@@ -980,7 +1019,7 @@ static void broadphase(void) {
  * balance check). Each piece is short, so the game can stop at a deadline and
  * carry on next frame. Positions only change at the end of a step, so whatever
  * is drawn in between is a whole step. */
-enum { PH_IDLE, PH_UPDATE, PH_CARRY, PH_HASH, PH_BP, PH_NARROW, PH_WAKE, PH_ISL, PH_SOLVE, PH_PTS,
+enum { PH_IDLE, PH_UPDATE, PH_CARRY, PH_HASH, PH_BP, PH_NARROW, PH_WAKE, PH_ISL, PH_ARC, PH_SOLVE, PH_PTS,
        PH_WL, PH_INT, PH_SUP, PH_SLEEP, PH_TIP, PH_TIPB, PH_FIN };
 static int ph_c, ph_mi, ph_pi;
 static u8 ph_sub, ph_pass, ph_it, ph_any, ph_unlimited;
@@ -1073,7 +1112,7 @@ __attribute__((noinline)) static void step_bp(void) {
   for (int k = 0; k < aw_n; k++) {
     int i = aw_list[k]; BodyVel* v = &phys_vel[i];
     fx ax = v->vx < 0 ? -v->vx : v->vx, ay = v->vy < 0 ? -v->vy : v->vy, aw = v->w < 0 ? -v->w : v->w;
-    speed[i] = ax + ay + fxmul(aw, FX(2.5)) + fxmul(GRAVITY, DT);
+    speed[i] = ax + ay + fxmul(aw, FX(2.5)) + fxmul(gravity, DT);
   }
   broadphase();
 }
@@ -1083,6 +1122,7 @@ __attribute__((noinline)) static void step_bp(void) {
 #define EST_PART_PAIR 180
 static int ph_pp;
 static int narrow_pair(int i, int j) {
+  if (wgroup[i] && wgroup[i] == wgroup[j]) return 1;     /* welded together (arcade) */
   Body* A = &phys_bodies[i]; Body* B = &phys_bodies[j];
   /* speculative margin grows with speed so fast drops don't tunnel deep into the
      stack: with how fast the two could close in on each other (bounded by their
@@ -1204,6 +1244,7 @@ ROM_CODE static int wake_pass(void) {
     if ((L->flags & (BODY_STATIC | BODY_SLEEP)) || !(U->flags & BODY_SLEEP) || (U->flags & BODY_STATIC)) continue;
     wake_body(hi); woke[hi] = 1; woke_list[nwoke++] = hi; changed = 1;
   }
+  if (nwelds && weld_wake()) changed = 1;      /* welded bodies wake together */
   if (changed) ph_from = 0;
   return !changed || ++ph_wp >= 16;
 }
@@ -1220,10 +1261,12 @@ ROM_CODE static void step_islands(void) {
     if (!is_awake_dyn(&phys_bodies[r->a]) || !is_awake_dyn(&phys_bodies[r->b])) continue;
     uf_union(r->a, r->b);
   }
+  if (nwelds) weld_islands();
 }
 
 __attribute__((noinline)) static void step_gravity(void) {
-  for (int k = 0; k < aw_n; k++) phys_vel[aw_list[k]].vy -= fxmul(GRAVITY, H);
+  fx g = grav_h;
+  for (int k = 0; k < aw_n; k++) phys_vel[aw_list[k]].vy -= g;
 }
 
 __attribute__((noinline)) static void step_integrate_vel(void) {
@@ -1286,7 +1329,8 @@ ROM_CODE static int sleep_bodies(int k0, int k1) {
     int i = aw_list[k];
     Body* b = &phys_bodies[i];
     bp_isaw[i] = 0;
-    if (island_min[uf_find(i)] >= SLEEP_TIME || (b->sleepTime >= SLEEP_TIME && sup_state[i] == 1)) {
+    /* a welded body sleeps only with its whole group */
+    if (island_min[uf_find(i)] >= SLEEP_TIME || (b->sleepTime >= SLEEP_TIME && sup_state[i] == 1 && !wgroup[i])) {
       b->flags |= BODY_SLEEP; phys_vel[i].vx = phys_vel[i].vy = phys_vel[i].w = 0; speed[i] = 0;
       tip_note_sleep(i);
       update_body(b);
@@ -1309,6 +1353,7 @@ ROM_CODE static int tip_bodies(void) {
     Body* b = &phys_bodies[i];
     if (!tip_busy) {
       if (!tip_sup[i] || (b->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) != (BODY_USED | BODY_SLEEP)) continue;
+      if (wgroup[i]) continue;              /* held up by its welds, not only its contacts */
       if (!can_run(EST_TIP_NODES)) return 0;
       if (++tip_gen == 0) { for (int q = 0; q < MAX_BODIES; q++) tip_mark[q] = 0; tip_gen = 1; }
       tip_sp = 0; tip_stack[tip_sp++] = i; tip_mark[i] = tip_gen;
@@ -1317,7 +1362,7 @@ ROM_CODE static int tip_bodies(void) {
     for (int n = 0; tip_sp; n++) {
       if (n == TIP_NODES) { if (!can_run(EST_TIP_NODES)) return 0; n = 0; }
       int c = tip_stack[--tip_sp];
-      fx mass = piece_defs[phys_bodies[c].shape].mass;
+      fx mass = body_mass[c];
       tip_mx += (s64)mass * phys_bodies[c].p.x; tip_mt += mass;
       for (int q = 0; q < tip_above_n[c]; q++) { int u = tip_above[c][q]; if (tip_mark[u] != tip_gen) { tip_mark[u] = tip_gen; tip_stack[tip_sp++] = u; } }
     }
@@ -1334,6 +1379,462 @@ ROM_CODE static int tip_bodies(void) {
 ROM_CODE static void step_finish(void) {
   for (int k = 0; k < nwoke; k++) woke[woke_list[k]] = 0;
   phys_awake = aw_n; phys_points = npts;
+}
+
+
+/* ---- arcade: shapes ----------------------------------------------------- */
+ROM_CODE static u32 isqrt64(u64 x) {
+  u64 r = 0, bit = 1ull << 62;
+  while (bit > x) bit >>= 2;
+  while (bit) {
+    if (x >= r + bit) { x -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+    bit >>= 2;
+  }
+  return (u32)r;
+}
+/* outward normals of a CCW polygon from its edges */
+ROM_CODE static void part_normals(PiecePart* pp) {
+  for (int i = 0; i < pp->n; i++) {
+    int j = i + 1 == pp->n ? 0 : i + 1;
+    s32 ex = pp->v[j][0] - pp->v[i][0], ey = pp->v[j][1] - pp->v[i][1];
+    u32 len = isqrt64((u64)((s64)ex * ex + (s64)ey * ey));     /* Q16 */
+    if (!len) len = 1;
+    pp->nrm[i][0] = (s32)(((s64)ey << 16) / len); pp->nrm[i][1] = (s32)(((s64)-ex << 16) / len);
+  }
+}
+ROM_CODE void phys_shape(int shape, int size, int tip, PhysShape* out) {
+  static const fx sizes[3] = { FX(0.5), FX(1.0), FX(1.5) };
+  const PieceDef* d = &piece_defs[shape];
+  fx sc = sizes[size], ky = FX_ONE;
+  if (tip & 1) ky = (fx)(((s64)FX_ONE << 16) / (d->top + d->bottom));   /* one cell thick */
+  if (tip >= 2) ky = -ky;
+  fx sy = fxmul(sc, ky), aky = ky < 0 ? -ky : ky;
+  out->shape = shape; out->size = size; out->tip = tip; out->nparts = d->nparts;
+  out->sx = sc; out->sy = sy;
+  out->sox = fxmul(d->sox, sc); out->soy = fxmul(d->soy, sy);
+  fx top = -0x7FFFFFFF, bot = 0x7FFFFFFF;
+  float area = 0, j2 = 0;
+  for (int p = 0; p < d->nparts; p++) {
+    const PiecePart* in = &d->parts[p];
+    PiecePart* pp = &out->parts[p];
+    if (in->n == 1) {
+      fx cx = fxmul(in->v[0][0], sc), cy = fxmul(in->v[0][1], sy), r = fxmul(in->nrm[0][0], sc);
+      if (aky == FX_ONE) {                      /* still a circle */
+        pp->n = 1; pp->v[0][0] = cx; pp->v[0][1] = cy; pp->nrm[0][0] = r; pp->nrm[0][1] = 0;
+        if (cy + r > top) top = cy + r; if (cy - r < bot) bot = cy - r;
+        float fr = r / 65536.f, fcx = cx / 65536.f, fcy = cy / 65536.f, a = 3.14159265f * fr * fr;
+        area += a; j2 += a * (fr * fr / 2 + fcx * fcx + fcy * fcy);
+        continue;
+      }
+      /* a disc seen edge-on is a slab */
+      fx hw = r, hh = fxmul(r, aky);
+      pp->n = 4;
+      pp->v[0][0] = cx - hw; pp->v[0][1] = cy - hh; pp->v[1][0] = cx + hw; pp->v[1][1] = cy - hh;
+      pp->v[2][0] = cx + hw; pp->v[2][1] = cy + hh; pp->v[3][0] = cx - hw; pp->v[3][1] = cy + hh;
+    } else {
+      pp->n = in->n;
+      for (int i = 0; i < in->n; i++) {
+        int q = ky < 0 ? in->n - 1 - i : i;     /* a flip turns CW: reverse */
+        pp->v[i][0] = fxmul(in->v[q][0], sc); pp->v[i][1] = fxmul(in->v[q][1], sy);
+      }
+    }
+    part_normals(pp);
+    for (int i = 0; i < pp->n; i++) {
+      int k = i + 1 == pp->n ? 0 : i + 1;
+      float x0 = pp->v[i][0] / 65536.f, y0 = pp->v[i][1] / 65536.f, x1 = pp->v[k][0] / 65536.f, y1 = pp->v[k][1] / 65536.f;
+      float cr = x0 * y1 - x1 * y0;
+      area += cr / 2;
+      j2 += cr * (x0 * x0 + x0 * x1 + x1 * x1 + y0 * y0 + y0 * y1 + y1 * y1) / 12;
+      if (pp->v[i][1] > top) top = pp->v[i][1];
+      if (pp->v[i][1] < bot) bot = pp->v[i][1];
+    }
+  }
+  /* the same block, so the same mass (scaled with its size); inertia from the shape */
+  out->mass = fxmul(fxmul(d->mass, sc), sc);
+  if (aky == FX_ONE) out->inertia = fxmul(fxmul(fxmul(fxmul(d->inertia, sc), sc), sc), sc);
+  else out->inertia = (s32)(out->mass / 65536.f * (j2 / area) * 65536.f);
+  out->top = top; out->bottom = -bot;
+}
+
+/* ---- arcade: welds --------------------------------------------------------
+ * A weld holds two bodies' relative position and angle: a 2D point constraint
+ * plus an angle constraint at an anchor between them, solved with the contacts
+ * in every substep (warm started, Baumgarte push-out in the biased pass). A
+ * side that is asleep or static is ground. */
+#define MAX_WELDS 64
+typedef struct {
+  u8 a, b, act, pad;                  /* act: bit 0 a moves, bit 1 b moves this step */
+  fx lax, lay, lbx, lby, ref;         /* anchor in each body's frame; angle b - a when welded */
+  fx Px, Py, Pa;                      /* impulses, kept for warm starting */
+  fx rax, ray, rbx, rby, cx, cy, ca;  /* this step: anchor arms, error at the start */
+  fx ima, imb, iia, iib;
+  fx m11, m12, m13, m22, m23, m33;    /* inverse of the 3x3 effective mass (point and angle together) */
+} Weld;
+static Weld welds[MAX_WELDS] EWRAM_BSS;
+int phys_weld_count(void) { return nwelds; }
+
+ROM_CODE static void weld_groups(void) {
+  static u8 par[MAX_BODIES] EWRAM_BSS, inw[MAX_BODIES] EWRAM_BSS;
+  for (int i = 0; i < MAX_BODIES; i++) { par[i] = i; inw[i] = 0; wgroup[i] = 0; }
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    inw[w->a] = 1;
+    if (phys_bodies[w->b].flags & BODY_STATIC) continue;
+    int a = w->a, b = w->b;
+    while (par[a] != a) a = par[a];
+    while (par[b] != b) b = par[b];
+    if (a != b) par[a] = b;
+    inw[w->a] = inw[w->b] = 1;
+  }
+  for (int i = 0; i < MAX_BODIES; i++) if (inw[i]) { int r = i; while (par[r] != r) r = par[r]; wgroup[i] = r + 1; }
+}
+
+ROM_CODE int phys_weld(int a, int b) {
+  if (a == b || nwelds >= MAX_WELDS) return 0;
+  if (phys_bodies[a].flags & BODY_STATIC) { int t = a; a = b; b = t; }
+  Body* A = &phys_bodies[a]; Body* B = &phys_bodies[b];
+  if (!(A->flags & BODY_USED) || !(B->flags & BODY_USED) || (A->flags & BODY_STATIC)) return 0;
+  if (B->flags & BODY_STATIC) {               /* each block of a group touching the base holds on to it */
+    for (int k = 0; k < nwelds; k++) if (welds[k].b == b && welds[k].a == a) return 0;
+  } else if (wgroup[a] && wgroup[a] == wgroup[b]) return 0;
+  Weld* w = &welds[nwelds++];
+  w->a = a; w->b = b; w->act = 0;
+  fx px = A->p.x + (B->p.x - A->p.x) / 2, py = A->p.y + (B->p.y - A->p.y) / 2;
+  if (B->flags & BODY_STATIC) { px = A->p.x; py = A->p.y; }   /* the base's centre is far away */
+  fx dx = px - A->p.x, dy = py - A->p.y;
+  w->lax = fxmul(A->c, dx) + fxmul(A->s, dy); w->lay = -fxmul(A->s, dx) + fxmul(A->c, dy);
+  dx = px - B->p.x; dy = py - B->p.y;
+  w->lbx = fxmul(B->c, dx) + fxmul(B->s, dy); w->lby = -fxmul(B->s, dx) + fxmul(B->c, dy);
+  w->ref = B->a - A->a;
+  w->Px = w->Py = w->Pa = 0;
+  weld_groups();
+  return 1;
+}
+
+ROM_CODE static void weld_drop(int i) {
+  int n = 0, any = 0;
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    if (w->a == i || w->b == i) { request_wake(w->a == i ? w->b : w->a); any = 1; continue; }
+    if (n != k) welds[n] = *w;
+    n++;
+  }
+  nwelds = n;
+  if (any) weld_groups();
+}
+
+ROM_CODE static int weld_wake(void) {
+  int changed = 0;
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    Body* A = &phys_bodies[w->a]; Body* B = &phys_bodies[w->b];
+    if (is_awake_dyn(A) && (B->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == (BODY_USED | BODY_SLEEP)) {
+      wake_body(w->b); woke[w->b] = 1; woke_list[nwoke++] = w->b; changed = 1;
+    } else if (is_awake_dyn(B) && (A->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == (BODY_USED | BODY_SLEEP)) {
+      wake_body(w->a); woke[w->a] = 1; woke_list[nwoke++] = w->a; changed = 1;
+    }
+  }
+  return changed;
+}
+ROM_CODE static void weld_islands(void) {
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    if (bp_isaw[w->a] && bp_isaw[w->b]) uf_union(w->a, w->b);
+  }
+}
+
+/* this step's anchor arms, error and inverse effective mass of one weld */
+ROM_ARM static void weld_prepare(Weld* w) {
+  int da = bp_isaw[w->a], db = bp_isaw[w->b];
+  w->act = (da ? 1 : 0) | (db ? 2 : 0);
+  if (!w->act) return;
+  Body* A = &phys_bodies[w->a]; Body* B = &phys_bodies[w->b];
+  w->rax = fxmul(A->c, w->lax) - fxmul(A->s, w->lay); w->ray = fxmul(A->s, w->lax) + fxmul(A->c, w->lay);
+  w->rbx = fxmul(B->c, w->lbx) - fxmul(B->s, w->lby); w->rby = fxmul(B->s, w->lbx) + fxmul(B->c, w->lby);
+  w->cx = B->p.x + w->rbx - A->p.x - w->rax; w->cy = B->p.y + w->rby - A->p.y - w->ray;
+  fx ca = B->a - A->a - w->ref;
+  while (ca > FX_PI) ca -= 2 * FX_PI;
+  while (ca < -FX_PI) ca += 2 * FX_PI;
+  w->ca = ca;
+  w->ima = da ? body_invM[w->a] : 0; w->iia = da ? body_invI[w->a] : 0;
+  w->imb = db ? body_invM[w->b] : 0; w->iib = db ? body_invI[w->b] : 0;
+  /* solving the point and the angle as one 3x3 block (as Box2D's weld joint
+     does) instead of one after the other keeps a light block welded to a
+     heavy one from shaking: the two parts are strongly coupled through its
+     small inertia */
+  fx ma = w->ima + w->imb, ia = w->iia, ib = w->iib;
+  fx k11 = ma + fxmul(ia, fxmul(w->ray, w->ray)) + fxmul(ib, fxmul(w->rby, w->rby));
+  fx k12 = -fxmul(ia, fxmul(w->rax, w->ray)) - fxmul(ib, fxmul(w->rbx, w->rby));
+  fx k13 = -fxmul(ia, w->ray) - fxmul(ib, w->rby);
+  fx k22 = ma + fxmul(ia, fxmul(w->rax, w->rax)) + fxmul(ib, fxmul(w->rbx, w->rbx));
+  fx k23 = fxmul(ia, w->rax) + fxmul(ib, w->rbx);
+  fx k33 = ia + ib;
+  s64 c11 = ((s64)k22 * k33 - (s64)k23 * k23) >> 16, c12 = ((s64)k13 * k23 - (s64)k12 * k33) >> 16;
+  s64 c13 = ((s64)k12 * k23 - (s64)k13 * k22) >> 16, c22 = ((s64)k11 * k33 - (s64)k13 * k13) >> 16;
+  s64 c23 = ((s64)k12 * k13 - (s64)k11 * k23) >> 16, c33 = ((s64)k11 * k22 - (s64)k12 * k12) >> 16;
+  s64 det = k11 * c11 + k12 * c12 + k13 * c13;      /* Q32 */
+  if (det <= 0) { w->act = 0; return; }
+  /* m = c / det in Q16 = c * 2^32 / det: one 16-bit reciprocal of det's top
+     bits instead of six 64-bit divisions (plenty for an iterative solver) */
+  int e = 0; u64 d = (u64)det;
+  while (d >> 24) { d >>= 8; e += 8; }
+  while (d >> 16) { d >>= 1; e++; }
+  if (d < 0x8000) { d = (u64)det << 16 >> e; e -= 16; while (d >> 16) { d >>= 1; e++; } }   /* tiny det: keep 16 bits */
+  u32 r = udiv32(0x80000000u, (u32)d);                 /* 2^31 / top bits */
+  int sh = e - 1;                                       /* c * r * 2^32 / (2^31 * 2^e) */
+#define WMUL(c) (fx)(sh >= 0 ? ((c) * (s64)r) >> sh : ((c) * (s64)r) << -sh)
+  w->m11 = WMUL(c11); w->m12 = WMUL(c12); w->m13 = WMUL(c13);
+  w->m22 = WMUL(c22); w->m23 = WMUL(c23); w->m33 = WMUL(c33);
+#undef WMUL
+}
+ROM_ARM static void weld_impulse(Weld* w, fx px, fx py, fx pa) {
+  if (w->act & 1) {
+    BodyVel* v = &phys_vel[w->a];
+    v->vx -= fxmul(w->ima, px); v->vy -= fxmul(w->ima, py);
+    v->w -= fxmul(w->iia, fxmul(w->rax, py) - fxmul(w->ray, px) + pa);
+  }
+  if (w->act & 2) {
+    BodyVel* v = &phys_vel[w->b];
+    v->vx += fxmul(w->imb, px); v->vy += fxmul(w->imb, py);
+    v->w += fxmul(w->iib, fxmul(w->rbx, py) - fxmul(w->rby, px) + pa);
+  }
+}
+/* Soft constraint (as in Box2D v3): a stiff spring-damper toward the welded
+   pose. Plain Baumgarte plus warm starting pumps energy into a chain of welds;
+   the impulse scale bleeds a little of the accumulated impulse each pass,
+   which keeps long sticky chains stable. 60 Hz, damping ratio 2, 240 Hz substeps. */
+#ifndef WELD_HZ
+#define WELD_HZ 60.0
+#endif
+#ifndef WELD_ZETA
+#define WELD_ZETA 2.0
+#endif
+#define WELD_W   (2 * 3.14159265 * WELD_HZ)
+#define WELD_HW  (WELD_W / (60.0 * SUBSTEPS))
+#define WELD_A   (WELD_HW * (2 * WELD_ZETA + WELD_HW))
+#define WELD_BIAS FX(WELD_W / (2 * WELD_ZETA + WELD_HW))
+#define WELD_MS   FX(WELD_A / (1 + WELD_A))
+#define WELD_IS   FX(1 / (1 + WELD_A))
+static inline fx clamp_bias(fx b) { return b > MAX_BIAS_VEL ? MAX_BIAS_VEL : b < -MAX_BIAS_VEL ? -MAX_BIAS_VEL : b; }
+ROM_ARM static void weld_solve(Weld* w, int use_bias) {
+  static const BodyVel still = { 0, 0, 0, 0, 0, 0 };
+  const BodyVel* va = (w->act & 1) ? &phys_vel[w->a] : &still;
+  const BodyVel* vb = (w->act & 2) ? &phys_vel[w->b] : &still;
+  fx ms = FX_ONE, is = 0, bx = 0, by = 0, ba = 0;
+  if (use_bias) {
+    fx dqa = va->dq >> 8, dqb = vb->dq >> 8;
+    fx ex = w->cx + ((vb->dpx - va->dpx) >> 8) - fxmul(dqb, w->rby) + fxmul(dqa, w->ray);
+    fx ey = w->cy + ((vb->dpy - va->dpy) >> 8) + fxmul(dqb, w->rbx) - fxmul(dqa, w->rax);
+    bx = clamp_bias(fxmul(WELD_BIAS, ex)); by = clamp_bias(fxmul(WELD_BIAS, ey));
+    ba = clamp_bias(fxmul(WELD_BIAS, w->ca + dqb - dqa));
+    ms = WELD_MS; is = WELD_IS;
+  }
+  fx cx = vb->vx - fxmul(vb->w, w->rby) - va->vx + fxmul(va->w, w->ray) + bx;
+  fx cy = vb->vy + fxmul(vb->w, w->rbx) - va->vy - fxmul(va->w, w->rax) + by;
+  fx ca = vb->w - va->w + ba;
+  fx lx = -fxmul(ms, fxmul(w->m11, cx) + fxmul(w->m12, cy) + fxmul(w->m13, ca)) - fxmul(is, w->Px);
+  fx ly = -fxmul(ms, fxmul(w->m12, cx) + fxmul(w->m22, cy) + fxmul(w->m23, ca)) - fxmul(is, w->Py);
+  fx la = -fxmul(ms, fxmul(w->m13, cx) + fxmul(w->m23, cy) + fxmul(w->m33, ca)) - fxmul(is, w->Pa);
+  w->Px += lx; w->Py += ly; w->Pa += la;
+  weld_impulse(w, lx, ly, la);
+}
+
+/* The weld passes, a few welds at a time like the contact passes, so a big
+   sticky pile slows the simulation down instead of running past the frame.
+   what: 0 prepare (before the substeps), 5 warm start, 6 biased, 7 relax (the
+   solver pass numbers they follow). Returns -1 out of time, 0 done, 1 more. */
+#define WELD_CHUNK 6
+static int ph_wk;
+static u16 rate_wprep = 120 * 16, rate_weld = 40 * 16;
+ROM_ARM static int welds_piece(int what) {
+  if (ph_wk >= nwelds) return 0;
+  int end = ph_wk + WELD_CHUNK; if (end > nwelds) end = nwelds;
+  int n = 0;                           /* the welds that move cost; the rest are skipped */
+  for (Weld* w = &welds[ph_wk]; w < &welds[end]; w++) n += what ? w->act != 0 : (bp_isaw[w->a] | bp_isaw[w->b]) != 0;
+  if (!can_run(EST(what ? rate_weld : rate_wprep, n))) return -1;
+  u16 t0 = tnow();
+  for (Weld* w = &welds[ph_wk]; w < &welds[end]; w++) {
+    if (!what) weld_prepare(w);
+    else if (!w->act) continue;
+    else if (what == 5) weld_impulse(w, w->Px, w->Py, w->Pa);
+    else weld_solve(w, what == 6);
+  }
+  if (what) rate_weld = track_rate(rate_weld, t0, n); else rate_wprep = track_rate(rate_wprep, t0, n);
+  ph_wk = end;
+  return 1;
+}
+/* after a weld pass: on to the next solver pass */
+ROM_CODE static void welds_next(void) {
+  ph_wk = 0; ph_mi = ph_pi = 0;
+  if (ph_pass == 5) ph_pass = 2;
+  else if (ph_pass == 6) { if (++ph_it < ITERS) ph_pass = 2; else { ph_it = 0; ph_pass = 3; } }
+  else { ph_pass = 0; ph_sub++; }
+}
+
+/* ---- arcade: magnets ------------------------------------------------------
+ * The web version's magnet force, in block units: within MAG_RANGE (0.035 m)
+ * of each other's outlines, opposite charges pull with up to 0.3 N and like
+ * ones push with half that, eased in with a smoothstep and damped along the
+ * line between them, times the lighter block's mass over a 4-cell block's.
+ * Each block's total is capped at 1.5 g. 1 N on these units is 6024
+ * (cells^2 x cells/s^2, at the web's arcade density of 425 kg/m^3). */
+#define MAG_RANGE FX(1.4)
+#define MAG_PULL  FX(1807.0)
+#define MAG_DAMP  FX(4.52)
+#define MAG_M4    FX(4.0)
+#define MAG_ACC_MAX FX(677.0)
+#define MAX_MAG 24
+static s64 mag_fx[MAX_MAG] EWRAM_BSS, mag_fy[MAX_MAG] EWRAM_BSS;
+static fx mag_gap[MAX_MAG] EWRAM_BSS;
+static u8 mag_list[MAX_MAG] EWRAM_BSS;
+static u8 mag_n EWRAM_BSS, mag_p EWRAM_BSS, mag_q EWRAM_BSS;
+static u16 rate_magpair = 30 * 16;
+
+/* distance from point c to a convex polygon (0 inside) */
+ROM_ARM static fx point_poly_dist(V2 c, const Poly* P) {
+  s64 best = -1; int inside = 1;
+  for (int i = 0; i < P->n; i++) {
+    const V2* a = &P->v[i]; const V2* b = &P->v[i + 1 == P->n ? 0 : i + 1];
+    fx ex = b->x - a->x, ey = b->y - a->y, qx = c.x - a->x, qy = c.y - a->y;
+    if (fxmul(P->nrm[i].x, qx) + fxmul(P->nrm[i].y, qy) > 0) inside = 0;
+    s64 ee = (s64)ex * ex + (s64)ey * ey, qe = (s64)qx * ex + (s64)qy * ey;
+    fx t = qe <= 0 ? 0 : qe >= ee ? FX_ONE : (fx)((qe << 16) / ee);
+    fx dx = qx - fxmul(ex, t), dy = qy - fxmul(ey, t);
+    s64 d2 = (s64)dx * dx + (s64)dy * dy;
+    if (best < 0 || d2 < best) best = d2;
+  }
+  if (inside) return 0;
+  return (fx)isqrt64((u64)best);
+}
+/* gap between two parts. Two polygons use their largest separation along an
+   edge normal (the collision test's own, fast): exact where a corner faces an
+   edge, a little short of the true distance corner to corner, which only
+   strengthens the force there slightly. */
+ROM_ARM static fx part_gap(const Poly* P, const Poly* Q) {
+  if (P->n == 1 && Q->n == 1) {
+    V2 n; fx d = unit_of(Q->v[0].x - P->v[0].x, Q->v[0].y - P->v[0].y, &n) - P->nrm[0].x - Q->nrm[0].x;
+    return d > 0 ? d : 0;
+  }
+  if (P->n == 1) { const Poly* t = P; P = Q; Q = t; }
+  if (Q->n == 1) { fx d = point_poly_dist(Q->v[0], P) - Q->nrm[0].x; return d > 0 ? d : 0; }
+  int e;
+  fx d = max_separation(P, Q, &e);
+  if (d < MAG_RANGE) { fx d2 = max_separation(Q, P, &e); if (d2 > d) d = d2; }
+  return d > 0 ? d : 0;
+}
+ROM_ARM static fx body_gap(const Body* A, const Body* B) {
+  fx best = MAG_RANGE;
+  fx keep = sep_margin; sep_margin = MAG_RANGE;      /* max_separation stops early past this */
+  for (int p = 0; p < A->nparts && best; p++) for (int q = 0; q < B->nparts; q++) {
+    const Poly* P = &A->wp[p]; const Poly* Q = &B->wp[q];
+    if (P->bmin.x - Q->bmax.x >= best || Q->bmin.x - P->bmax.x >= best || P->bmin.y - Q->bmax.y >= best || Q->bmin.y - P->bmax.y >= best) continue;
+    fx d = part_gap(P, Q);
+    if (d < best) { best = d; if (!d) break; }
+  }
+  sep_margin = keep;
+  return best;
+}
+/* one pair's force, added to both bodies' totals */
+ROM_ARM static void magnet_pair(int p, int q) {
+  int i = mag_list[p], j = mag_list[q];
+  const Body* A = &phys_bodies[i]; const Body* B = &phys_bodies[j];
+  fx gap = body_gap(A, B);
+  if (gap >= MAG_RANGE) return;
+  V2 nn;
+  if (!unit_of(B->p.x - A->p.x, B->p.y - A->p.y, &nn)) return;
+  fx c = FX_ONE - fxmul(gap, FX(1.0 / 1.4));         /* 1 - gap / MAG_RANGE */
+  fx l = fxmul(fxmul(c, c), 3 * FX_ONE - 2 * c);
+  const BodyVel* va = &phys_vel[i]; const BodyVel* vb = &phys_vel[j];
+  fx f = fxmul((bp_isaw[j] ? vb->vx : 0) - (bp_isaw[i] ? va->vx : 0), nn.x) + fxmul((bp_isaw[j] ? vb->vy : 0) - (bp_isaw[i] ? va->vy : 0), nn.y);
+  fx damp = fxmul(fxmul(f, MAG_DAMP), l), m;
+  if (phys_charge[i] == phys_charge[j]) {
+    fx e = MAG_PULL / 2;
+    m = -fxmul(e, l) + damp; if (m < -e) m = -e; if (m > 0) m = 0;
+  } else {
+    m = fxmul(MAG_PULL, l) + damp; if (m < 0) m = 0; if (m > MAG_PULL) m = MAG_PULL;
+  }
+  fx mi = body_mass[i], mj = body_mass[j];
+  m = (fx)(((s64)m * (mi < mj ? mi : mj)) / MAG_M4);
+  mag_fx[p] += fxmul(nn.x, m); mag_fy[p] += fxmul(nn.y, m);
+  mag_fx[q] -= fxmul(nn.x, m); mag_fy[q] -= fxmul(nn.y, m);
+  if (gap < mag_gap[p]) mag_gap[p] = gap;
+  if (gap < mag_gap[q]) mag_gap[q] = gap;
+  mag_on = 1;
+}
+/* each body's total, capped, as a velocity change for this step (no 64-bit
+   divisions: they cost more than everything else here together) */
+ROM_ARM static void magnets_apply(void) {
+  fx amax = fxmul(gravity, FX(1.5)); if (amax > MAG_ACC_MAX) amax = MAG_ACC_MAX;
+  for (int k = 0; k < mag_n; k++) {
+    if (!mag_fx[k] && !mag_fy[k]) continue;
+    int i = mag_list[k];
+    fx ax = (fx)((mag_fx[k] * body_invM[i]) >> 16), ay = (fx)((mag_fy[k] * body_invM[i]) >> 16);
+    V2 dir; fx a = unit_of(ax, ay, &dir);
+    if (a > amax) { ax = fxmul(dir.x, amax); ay = fxmul(dir.y, amax); }
+    if (bp_isaw[i]) { phys_vel[i].vx += fxmul(ax, DT); phys_vel[i].vy += fxmul(ay, DT); }
+    else if (mag_gap[k] > FX(0.1) && a > gravity / 4) request_wake(i);   /* pulled hard from a gap */
+  }
+}
+/* The arcade's part of a step, before the solver: magnet forces a pair at a
+   time, then the welds' effective masses a few at a time. Returns -1 out of
+   time, 0 done, 1 more. */
+ROM_CODE static int phys_charge_any(void);
+ROM_CODE static int arc_piece(void) {
+  switch (arc_stage) {
+    case 0:                            /* which bodies have a charge */
+      arc_stage = 3; ph_wk = 0;
+      if (!mag_on && !phys_charge_any()) return 1;
+      if (!can_run(16 + phys_count)) return -1;
+      mag_on = 0; mag_n = 0;
+      for (int i = 0; i < phys_count && mag_n < MAX_MAG; i++)
+        if (phys_charge[i] && (phys_bodies[i].flags & (BODY_USED | BODY_STATIC | BODY_NEW)) == BODY_USED) {
+          mag_fx[mag_n] = mag_fy[mag_n] = 0; mag_gap[mag_n] = MAG_RANGE; mag_list[mag_n++] = i;
+        }
+      if (mag_n >= 2) { arc_stage = 1; mag_p = 0; mag_q = 1; }
+      return 1;
+    case 1:                            /* pairs, as time allows */
+      for (; mag_p < mag_n - 1; mag_p++, mag_q = mag_p + 1) {
+        for (; mag_q < mag_n; mag_q++) {
+          int i = mag_list[mag_p], j = mag_list[mag_q];
+          if (!bp_isaw[i] && !bp_isaw[j]) continue;
+          const Body* A = &phys_bodies[i]; const Body* B = &phys_bodies[j];
+          if (A->bmin.x - B->bmax.x >= MAG_RANGE || B->bmin.x - A->bmax.x >= MAG_RANGE ||
+              A->bmin.y - B->bmax.y >= MAG_RANGE || B->bmin.y - A->bmax.y >= MAG_RANGE) continue;
+          int n = A->nparts * B->nparts;    /* the cost goes with the part pairs to measure */
+          if (!can_run(EST(rate_magpair, n))) return -1;
+          u16 t0 = tnow(); magnet_pair(mag_p, mag_q); rate_magpair = track_rate(rate_magpair, t0, n);
+        }
+      }
+      arc_stage = 2;
+      return 1;
+    case 2:
+      if (!can_run(16 + 24 * mag_n)) return -1;
+      magnets_apply();
+      arc_stage = 3;
+      return 1;
+    default: {                         /* welds */
+      int r = welds_piece(0);
+      if (!r) { arc_stage = 0; ph_wk = 0; }
+      return r;
+    }
+  }
+}
+
+/* ---- arcade: contacts, removal, the between-steps hook ---- */
+ROM_CODE void phys_touching(const u8* flags, PhysPairFn fn) {
+  for (int k = 0; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (!r->tm || !(flags[r->a] | flags[r->b])) continue;
+    if (!(phys_bodies[r->a].flags & BODY_USED) || !(phys_bodies[r->b].flags & BODY_USED)) continue;
+    fn(r->a, r->b);
+  }
+}
+ROM_CODE void phys_remove_wake(int i) {
+  for (int k = 0; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (r->a == i) request_wake(r->b); else if (r->b == i) request_wake(r->a);
+  }
+  phys_remove(i);
 }
 
 #define SOLVE_CHUNK 8      /* manifolds per piece of a solver pass */
@@ -1373,6 +1874,10 @@ ROM_CODE static int pts_piece(void) {
 }
 
 static u8 ph_slept;
+ROM_CODE static int phys_charge_any(void) {
+  for (int i = 0; i < phys_count; i++) if (phys_charge[i] && (phys_bodies[i].flags & BODY_USED)) return 1;
+  return 0;
+}
 #define INT_CHUNK 16
 #define SLEEP_CHUNK 8
 
@@ -1432,17 +1937,23 @@ ROM_CODE static int step_advance(void) {
       if (!can_run(EST(rate_isl, n))) return 0;
       u16 t0 = tnow(); step_islands(); rate_isl = track_rate(rate_isl, t0, n);
       PROF(4);
-      ph = PH_SOLVE; ph_sub = 0; ph_pass = 0; ph_it = 0; break;
+      ph = PH_ARC; break;
+    }
+    case PH_ARC: {   /* arcade: magnet forces, welds */
+      int r = arc_piece(); if (r < 0) return 0;
+      if (!r) { ph = PH_SOLVE; ph_sub = 0; ph_pass = 0; ph_it = 0; }
+      break;
     }
     case PH_SOLVE:
       if (ph_sub == SUBSTEPS) { ph = PH_PTS; ph_mi = ph_pi = 0; break; }
       switch (ph_pass) {
         case 0: if (!can_run(16 + aw_n)) return 0; step_gravity(); ph_pass = 1; ph_mi = ph_pi = 0; break;
-        case 1: { int r = solve_piece(1); if (r < 0) return 0; if (!r) { ph_pass = 2; ph_mi = ph_pi = 0; } break; }
+        case 1: { int r = solve_piece(1); if (r < 0) return 0; if (!r) ph_pass = 5; break; }
         case 2: { int r = solve_piece(2); if (r < 0) return 0;
-                  if (!r) { if (++ph_it < ITERS) ph_mi = ph_pi = 0; else { ph_it = 0; ph_pass = 3; } } break; }
+                  if (!r) ph_pass = 6; break; }
         case 3: if (!can_run(16 + 2 * aw_n)) return 0; step_integrate_vel(); ph_pass = 4; ph_mi = ph_pi = 0; break;
-        case 4: { int r = solve_piece(4); if (r < 0) return 0; if (!r) { ph_pass = 0; ph_sub++; } break; }
+        case 4: { int r = solve_piece(4); if (r < 0) return 0; if (!r) ph_pass = 7; break; }
+        default: { int r = welds_piece(ph_pass); if (r < 0) return 0; if (!r) welds_next(); break; }   /* 5-7: the welds' turn */
       }
       break;
     case PH_PTS: {
@@ -1491,6 +2002,7 @@ ROM_CODE static int step_advance(void) {
     case PH_FIN:
       if (!can_run(16 + nwoke)) return 0;
       step_finish();
+      hook_due = 1;
       PROF(6);
       ph = PH_IDLE; return 1;
   }
@@ -1498,11 +2010,12 @@ ROM_CODE static int step_advance(void) {
 
 int phys_busy(void) { return ph != PH_IDLE; }
 
-int phys_run(u16 deadline, int may_start) {
+ROM_CODE int phys_run(u16 deadline, int may_start) {
   int r = 0;
   ph_deadline = deadline; ph_any = 0;
   if (ph == PH_IDLE) {
     if (!may_start) return 0;
+    if (hook_due) { hook_due = 0; if (phys_after_step) phys_after_step(); }
     r |= PHYS_STARTED;
     if (!step_needed()) { phys_awake = 0; phys_points = 0; return r | PHYS_DONE; }   /* all asleep: nothing to do */
     step_begin();
@@ -1511,16 +2024,24 @@ int phys_run(u16 deadline, int may_start) {
   return r;
 }
 
-void phys_step(void) {
+ROM_CODE void phys_step(void) {
   ph_unlimited = 1;
   if (ph != PH_IDLE) step_advance();      /* finish one in progress first */
   phys_run(0, 1);
   ph_unlimited = 0;
 }
 
-void phys_wake(int i) { request_wake(i); }
+ROM_CODE void phys_wake(int i) { request_wake(i); }
 
-void phys_remove(int i) { phys_bodies[i].flags = 0; bp_dirty = 1; arb_rescan = 1; }
+ROM_CODE void phys_remove(int i) {
+  phys_bodies[i].flags = 0; bp_dirty = 1; arb_rescan = 1; phys_charge[i] = 0;
+  if (nwelds) weld_drop(i);
+}
 #ifdef HOST
 Arbiter* dbg_arbs(int* n) { *n = narb; return arbs; }
+#endif
+#ifdef HOST
+void phys_debug_welds(void) {
+  for (int k = 0; k < nwelds; k++) printf("    weld %d-%d act %d P %.1f,%.1f,%.1f\n", welds[k].a, welds[k].b, welds[k].act, welds[k].Px / 65536.0, welds[k].Py / 65536.0, welds[k].Pa / 65536.0);
+}
 #endif

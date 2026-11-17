@@ -33,13 +33,20 @@ _Static_assert(OBJ_TILE_BASE + 32 <= 1024, "OBJ tiles don't fit");
 #define OBJPAL_RED 7
 #define OBJPAL_BASE 8
 #define OBJPAL_UI 9
+#define OBJPAL_MAG_POS 10      /* arcade specials */
+#define OBJPAL_MAG_NEG 11
+#define OBJPAL_STICKY 12
+#define OBJPAL_EXPLOSIVE 13
+#define OBJPAL_WEIRD 14
+#define OBJPAL_FIRE 15
+#define PAL_TXT_ACCENT 6       /* arcade: the condition's colour (BG bank 6, the title logo's otherwise) */
 
 extern ObjAttr oam_shadow[128];
 extern u16 txt_map[32 * 32];
 extern int txt_dirty;
 
 void video_init(void);
-void video_set_theme(int mode);      /* 0 relaxed, 1 classic, 2 expert: colours, sky, background layer */
+void video_set_theme(int mode);      /* 0 relaxed, 1 classic, 2 expert, 3 arcade: colours, sky, background layer */
 void video_vsync(int sky_offset);    /* wait for vblank and push shadows */
 extern volatile u16 vblank_tick;      /* timer 2 (64-cycle ticks) when the last VBlank began */
 #define FRAME_TICKS 4389              /* 280896 cycles */
@@ -47,6 +54,7 @@ void oam_clear(void);
 ObjAttr* oam_alloc(void);           /* next free OAM entry (or NULL) */
 void oam_reset_alloc(int first);
 void obj_affine_set(int idx, s32 cos16, s32 sin16, s32 scale8);  /* scale8: 256 = 1x display size */
+void obj_affine_set2(int idx, s32 cos16, s32 sin16, s32 sx8, s32 sy8);   /* scaled across and down (sy8 < 0: flipped) before turning */
 
 void txt_clear(void);
 void txt_clear_rect(int x, int y, int w, int h);

@@ -16,7 +16,14 @@ typedef struct {
   u8 bass_wave;                      /* 0 triangle, 1 soft saw */
 } Song;
 
-enum { SFX_PICKUP, SFX_PUTBACK, SFX_ROTATE_L, SFX_ROTATE_R, SFX_PLACE, SFX_ERROR, SFX_SELECT, SFX_SCORE, SFX_GAMEOVER, SFX_MOVE };
+enum { SFX_PICKUP, SFX_PUTBACK, SFX_ROTATE_L, SFX_ROTATE_R, SFX_PLACE, SFX_ERROR, SFX_SELECT, SFX_SCORE, SFX_GAMEOVER, SFX_MOVE,
+       SFX_EXPLODE, SFX_SQUISH, SFX_CHIME, SFX_WARN, SFX_TIP };
+
+/* arcade: the music changes with the condition (like the web version's
+   treatments of the hard track): up or down three semitones, a metallic,
+   dampened or rumbling voice, or slowed, flat and wobbling */
+enum { TR_PLAIN, TR_UP3, TR_DOWN3, TR_METAL, TR_DAMP, TR_RUMBLE, TR_WEIRD };
+void snd_set_treatment(int t);
 
 void snd_init(void);
 void snd_play_song(const Song* s);

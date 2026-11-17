@@ -7,6 +7,7 @@
  */
 #pragma once
 #include "gba.h"
+#include "gen/pieces_gen.h"
 
 typedef s32 fx;
 typedef struct { fx x, y; } V2;
@@ -39,7 +40,7 @@ typedef struct {
   V2 bmin, bmax;         /* body AABB */
   s16 sleepTime;
   u8 flags, shape, color, nparts;
-  u8 frx, fry, fra, pad;  /* sub-LSB position/angle remainders (Q24 integration) */
+  u8 frx, fry, fra, var;  /* sub-LSB position/angle remainders (Q24 integration); var: shape from phys_add_shape */
   Poly wp[MAX_PARTS];    /* world-space parts */
 } Body;
 
@@ -78,3 +79,43 @@ int phys_piece_world(int shape, fx x, fx y, fx angle, Poly* polys);
 int phys_overlaps(const Poly* polys, int n, fx tolerance);
 fx fx_sin(fx a);
 fx fx_cos(fx a);
+
+/* ---- arcade --------------------------------------------------------------
+ * Shapes: a piece scaled (size 0 tiny 0.5x, 1 normal, 2 giant 1.5x) and tipped
+ * toward the viewer in quarter turns (tip 0 as is, 1 edge-on, 2 upside down,
+ * 3 edge-on the other way). Edge-on is drawn and collides as the piece squashed
+ * to one cell tall, the thickness of a block seen from the side; it keeps its
+ * mass. sx, sy: how the sprite is scaled (sy < 0: flipped). */
+typedef struct {
+  s32 mass, inertia, top, bottom;     /* Q16, like PieceDef */
+  s32 sox, soy, sx, sy;
+  u8 shape, size, tip, nparts;
+  PiecePart parts[PIECE_MAX_PARTS];
+} PhysShape;
+void phys_shape(int shape, int size, int tip, PhysShape* out);
+int phys_add_shape(const PhysShape* ps, int color, fx x, fx y, fx angle);
+int phys_shape_world(const PhysShape* ps, fx x, fx y, fx angle, Poly* polys);
+const PhysShape* phys_body_shape(int i);           /* 0 for a plain piece */
+fx phys_body_mass(int i);
+
+/* world settings (arcade: lighter gravity, grippier and less bouncy blocks) */
+void phys_set_params(fx gravity, fx friction, fx restitution);
+
+/* Magnets: bodies with a charge pull opposite charges and push like ones within
+   MAG_RANGE of their outlines, like the web version's (forces scaled to block
+   masses, capped at 1.5 g). */
+extern s8 phys_charge[MAX_BODIES];
+
+/* Welds (sticky blocks): hold two bodies (or a body and the static base) in
+   their current relative pose. Welded bodies don't collide, wake and sleep
+   together. Between steps only. Returns 0 if they already are (indirectly). */
+int phys_weld(int a, int b);
+int phys_weld_count(void);
+/* every pair of bodies touching after the last step where flags[a] | flags[b] */
+typedef void (*PhysPairFn)(int a, int b);
+void phys_touching(const u8* flags, PhysPairFn fn);
+/* take a body out and wake whatever rested on or touched it (explosions) */
+void phys_remove_wake(int i);
+/* runs once after each step, before the next one starts: the game can add
+   welds and remove bodies there */
+extern void (*phys_after_step)(void);

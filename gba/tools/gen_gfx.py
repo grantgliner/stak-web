@@ -3,7 +3,9 @@
 title logo (converted from ../images/stak-logo.png) and a theme per mode: block
 colours, panel colours, sky gradient and a background layer (relaxed: clouds
 over a sunset beach; classic: stars; expert: champagne bubbles and gold
-sparkles on velvet)."""
+sparkles on velvet; arcade: neon confetti on a purple night). Also the arcade
+special-block palettes (magnets, sticky, explosive, weird, fire) and the
+condition accent colours."""
 import os, sys, random, math
 import numpy as np
 from PIL import Image
@@ -56,11 +58,12 @@ def ramp(base, gloss=True):
     pal[10] = tuple(np.clip(c * 0.25 + 200, 0, 255))           # specular
     return [rgb15(p) for p in pal]
 
-MODES = ['relaxed', 'classic', 'expert']
+MODES = ['relaxed', 'classic', 'expert', 'arcade']
 BLOCK_COLORS = {                    # the web version's tints per mode
     'relaxed': ['#62FFFD', '#5BFF89', '#FFB74A', '#FFEE58'],
     'classic': CLASSIC,
     'expert': ['#FFFFFF', '#555555', '#CEA63D'],
+    'arcade': ['#FF8A00', '#FFC700', '#AD00FF', '#FF00E5'],
 }
 def block_banks(cols):
     banks = [ramp(c) for c in cols]
@@ -76,7 +79,55 @@ ui = [0] * 16
 ui[1] = rgb15((255, 255, 255)); ui[2] = rgb15((20, 22, 40)); ui[3] = rgb15((255, 214, 64))
 ui[4] = rgb15((255, 138, 0)); ui[5] = rgb15((120, 220, 255))
 obj_pal.append(ui)                  # 9: UI sprites
-while len(obj_pal) < 16: obj_pal.append([0] * 16)
+
+# arcade specials (OBJ 10-15), like the web version's materials: magnets are
+# polished red (+) and blue (-) metal, sticky blocks glossy lime, explosive ones
+# black with glowing orange edges (animated), weird ones an iridescent purple to
+# teal sheen (animated); 15 is fire for explosions
+def metal(base):
+    c = np.array(hexc(base), float)
+    pal = [(0, 0, 0)] * 16
+    pal[1] = tuple(c * 0.18 + 6)
+    lv = [0.30, 0.42, 0.62, 0.48, 0.70, 0.95, 0.80, 1.10]       # banded, like brushed metal
+    for k in range(8):
+        col = c * lv[k]
+        if lv[k] > 0.9: col = col + (255 - col) * (lv[k] - 0.85) * 1.6
+        pal[2 + k] = tuple(np.clip(col, 0, 255))
+    pal[10] = (255, 255, 255)
+    return [rgb15(p) for p in pal]
+def explosive_pal(glow):
+    pal = [(0, 0, 0)] * 16
+    pal[1] = tuple(np.clip(np.array((255, 96, 0)) * (0.55 + 0.45 * glow), 0, 255))   # edges: the fissures
+    for k in range(8):
+        g = 14 + k * 7
+        pal[2 + k] = (g + 4, g, g - 2)
+    pal[5] = tuple(np.clip(np.array((255, 80, 0)) * (0.25 + 0.5 * glow), 0, 255))    # a crack across the faces
+    pal[10] = tuple(np.clip(np.array((255, 190, 60)) * (0.5 + 0.5 * glow), 0, 255))
+    return [rgb15(p) for p in pal]
+def weird_pal(phase):
+    a, b = np.array((191, 90, 242), float), np.array((70, 230, 210), float)
+    pal = [(0, 0, 0)] * 16
+    pal[1] = (30, 14, 46)
+    for k in range(8):
+        t = (math.sin((k / 7 + phase) * 2 * math.pi) + 1) / 2
+        col = (a * (1 - t) + b * t) * (0.55 + 0.06 * k)
+        pal[2 + k] = tuple(np.clip(col, 0, 255))
+    pal[10] = (240, 230, 255)
+    return [rgb15(p) for p in pal]
+fire = [0] * 16
+fire[1] = rgb15((120, 20, 10))
+for k, c in enumerate([(160, 30, 10), (200, 50, 10), (235, 90, 10), (250, 130, 20), (255, 170, 40), (255, 205, 80), (255, 235, 150), (255, 250, 220)]):
+    fire[2 + k] = rgb15(c)
+fire[10] = rgb15((255, 255, 255))
+obj_pal.append(metal('#FF3B30'))    # 10: magnet +
+obj_pal.append(metal('#2F7BFF'))    # 11: magnet -
+obj_pal.append(ramp('#9DFF2E'))     # 12: sticky
+obj_pal.append(explosive_pal(0.5))  # 13: explosive (animated)
+obj_pal.append(weird_pal(0))        # 14: weird (animated)
+obj_pal.append(fire)                # 15: fire
+assert len(obj_pal) == 16
+explosive_anim = [v for f in range(16) for v in explosive_pal((math.sin(f / 16 * 2 * math.pi) + 1) / 2)]
+weird_anim = [v for f in range(16) for v in weird_pal(f / 16)]
 
 # BG palettes 0-2 text, 3 panel, 4 panel highlighted (cursor), 5 background layer
 def textpal(fg, panel_fill, sh=(16, 18, 36)):
@@ -97,6 +148,10 @@ THEMES = {
     'expert': dict(panel=((206, 166, 61), (16, 12, 20), (26, 20, 30)), hi=((250, 246, 236), (44, 34, 26), (60, 46, 34)),
                    grey=(196, 178, 150),
                    layer=[(224, 210, 180), (176, 146, 92), (122, 94, 50), (96, 72, 40), (240, 232, 214), (120, 82, 120)]),
+    # arcade: magenta-rimmed panels on a purple night, neon confetti (muted so the blocks stay in front)
+    'arcade': dict(panel=((240, 40, 210), (28, 12, 40), (40, 18, 56)), hi=((255, 199, 0), (56, 34, 20), (72, 44, 26)),
+                   grey=(200, 176, 230),
+                   layer=[(196, 108, 30), (196, 164, 36), (146, 66, 206), (196, 46, 166), (104, 78, 138), (56, 150, 186)]),
 }
 def bg_palette(t):
     fill = t['panel'][1]
@@ -107,6 +162,10 @@ def bg_palette(t):
     banks.append(layer)
     return [v for b in banks for v in b]
 mode_bg_pal = [bg_palette(THEMES[m]) for m in MODES]
+# arcade condition accents for the HUD text (BG bank 6 while playing): all
+# clear, then giant, tiny, weird rotation, magnet storm, sticky, powder keg
+ACCENTS = [(214, 218, 236), (255, 159, 10), (99, 230, 190), (191, 90, 242), (40, 140, 255), (48, 209, 88), (255, 69, 58)]
+accent_pal = [v for c in ACCENTS for v in textpal(c, THEMES['arcade']['panel'][1])]
 bg_pal = [mode_bg_pal[1][i * 16:(i + 1) * 16] for i in range(6)]
 
 # ---------------------------------------------------------------- font (BG + OBJ use same layout)
@@ -258,12 +317,49 @@ def bubbles():
             img[y, x] = rnd.choice([2, 4])
     return img
 
+# arcade: neon confetti, outlined squares, triangles, rings, zigzags and plus
+# signs in the block colours, with dim pixel stars between them
+def confetti():
+    rnd = random.Random(23)
+    img = np.zeros((256, 256), int)
+    def put(x, y, c): img[y % 256, x % 256] = c
+    def line(x0, y0, x1, y1, c):
+        n = max(abs(x1 - x0), abs(y1 - y0), 1)
+        for i in range(n + 1): put(round(x0 + (x1 - x0) * i / n), round(y0 + (y1 - y0) * i / n), c)
+    cells = [(gx, gy) for gx in range(6) for gy in range(6)]
+    rnd.shuffle(cells)
+    for gx, gy in cells[:30]:
+        x = gx * 42 + rnd.randrange(4, 34); y = gy * 42 + rnd.randrange(4, 34)
+        c = rnd.choice([1, 2, 3, 4, 6]); k = rnd.randrange(5)
+        if k == 0:                                   # square, turned 45 degrees or not
+            r = rnd.choice([3, 4])
+            if rnd.random() < 0.5:
+                for a, b in [((-r, -r), (r, -r)), ((r, -r), (r, r)), ((r, r), (-r, r)), ((-r, r), (-r, -r))]: line(x + a[0], y + a[1], x + b[0], y + b[1], c)
+            else:
+                for a, b in [((0, -r - 1), (r + 1, 0)), ((r + 1, 0), (0, r + 1)), ((0, r + 1), (-r - 1, 0)), ((-r - 1, 0), (0, -r - 1))]: line(x + a[0], y + a[1], x + b[0], y + b[1], c)
+        elif k == 1:                                 # triangle
+            r = rnd.choice([4, 5]); up = rnd.random() < 0.5
+            pts = [(0, -r if up else r), (r, r - 1 if up else -r + 1), (-r, r - 1 if up else -r + 1)]
+            for i in range(3): line(x + pts[i][0], y + pts[i][1], x + pts[(i + 1) % 3][0], y + pts[(i + 1) % 3][1], c)
+        elif k == 2:                                 # ring
+            r = rnd.choice([3, 4])
+            for yy in range(-r - 1, r + 2):
+                for xx in range(-r - 1, r + 2):
+                    if abs(math.hypot(xx, yy) - r) < 0.55: put(x + xx, y + yy, c)
+        elif k == 3:                                 # zigzag
+            for i in range(4): line(x - 6 + i * 3, y + (2 if i & 1 else -2), x - 3 + i * 3, y + (-2 if i & 1 else 2), c)
+        else:                                        # plus
+            line(x - 3, y, x + 3, y, c); line(x, y - 3, x, y + 3, c)
+    for _ in range(70):                              # pixel stars
+        put(rnd.randrange(256), rnd.randrange(256), 5)
+    return img
+
 layer_tiles, layer_maps = [], []
 for m in MODES:
     if m == 'classic':
         t, mp = star_tiles, star_map
     else:
-        t, mp = tiled(clouds() if m == 'relaxed' else bubbles())
+        t, mp = tiled(clouds() if m == 'relaxed' else bubbles() if m == 'expert' else confetti())
     words = []
     for tile in t: words.extend(tiles4(tile))
     layer_tiles.append(words); layer_maps.append(mp)
@@ -316,6 +412,8 @@ SKY_STOPS = {
     'classic': [(0, (2, 2, 8)), (380, (6, 8, 28)), (640, (12, 18, 52)), (840, (24, 30, 82)), (960, (64, 46, 104)), (1023, (120, 70, 110))],
     # expert: black velvet with a wine-red glow at the base
     'expert': [(0, (4, 2, 6)), (400, (14, 6, 20)), (700, (30, 10, 36)), (880, (50, 16, 50)), (980, (76, 26, 60)), (1023, (100, 40, 70))],
+    # arcade: the web version's purple night (#0d0712, #2b1530, #48224e) with a neon glow at the base
+    'arcade': [(0, (8, 4, 12)), (380, (13, 7, 18)), (700, (30, 14, 36)), (880, (43, 21, 48)), (980, (72, 34, 78)), (1023, (118, 44, 108))],
 }
 def gradient(stops):
     out = []
@@ -400,10 +498,12 @@ with open(OUT_H, 'w') as f:
                     ('logo_pal', 'u16', len(logo_colors))]:
         f.write(f'extern const {t} {n}[{d}];\n')
     f.write('enum { PANEL_FILL, PANEL_TOP, PANEL_BOT, PANEL_LEFT, PANEL_RIGHT, PANEL_TL, PANEL_TR, PANEL_BL, PANEL_BR };\n')
-    f.write('/* per mode (relaxed, classic, expert): BG palettes 0-5, block palettes (OBJ 0-6) and colour count,\n'
+    f.write('/* per mode (relaxed, classic, expert, arcade): BG palettes 0-5, block palettes (OBJ 0-6) and colour count,\n'
             '   sky gradient (HBlank DMA), background layer tiles + map (BG2) */\n')
     f.write('typedef struct { const u16* bg_pal; const u16* block_pal; u8 ncolors; const u16* sky; const u32* layer_tiles; u16 layer_words; const u16* layer_map; } Theme;\n')
-    f.write('extern const Theme themes[3];\n')
+    f.write('extern const Theme themes[4];\n')
+    f.write('extern const u16 accent_pal[7 * 16];      /* arcade HUD text: all clear + the six conditions */\n')
+    f.write('extern const u16 explosive_anim[16 * 16], weird_anim[16 * 16];   /* OBJ banks 13 and 14, 16 frames */\n')
 
 with open(OUT_C, 'w') as f:
     f.write('/* generated by tools/gen_gfx.py */\n#include "gfx_gen.h"\n')
@@ -421,7 +521,10 @@ with open(OUT_C, 'w') as f:
         f.write(arr(f'{m}_sky', 'u16', skies[i], 16, '0x{:04X}').replace('const u16', 'static const u16'))
         f.write(arr(f'{m}_layer_tiles', 'u32', layer_tiles[i]).replace('const u32', 'static const u32'))
         f.write(arr(f'{m}_layer_map', 'u16', [v | (5 << 12) for v in layer_maps[i]], 16, '0x{:04X}').replace('const u16', 'static const u16'))
-    f.write('const Theme themes[3] = {\n')
+    f.write(arr('accent_pal', 'u16', accent_pal, 16, '0x{:04X}'))
+    f.write(arr('explosive_anim', 'u16', explosive_anim, 16, '0x{:04X}'))
+    f.write(arr('weird_anim', 'u16', weird_anim, 16, '0x{:04X}'))
+    f.write('const Theme themes[4] = {\n')
     for i, m in enumerate(MODES):
         f.write(f'  {{ {m}_bg_pal, {m}_block_pal, {len(BLOCK_COLORS[m])}, {m}_sky, {m}_layer_tiles, {len(layer_tiles[i])}, {m}_layer_map }},\n')
     f.write('};\n')

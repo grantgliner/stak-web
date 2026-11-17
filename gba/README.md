@@ -1,10 +1,11 @@
 # STAK! for Game Boy Advance
 
-A homebrew GBA version of STAK!: stack blocks on the base as high as you can before one falls off. It has the web version's three modes:
+A homebrew GBA version of STAK!: stack blocks on the base as high as you can before one falls off. It has the web version's four modes:
 
 - **Relaxed:** simple shapes, at a sunset beach.
 - **Classic:** the original pieces, under the stars.
 - **Expert:** adds a circle, a semicircle, a lollipop and a seesaw, on black velvet with champagne bubbles.
+- **Arcade:** special blocks and changing conditions, under neon confetti.
 
 Each mode has its own music, colours and best score. Unlike the web version, expert is unlocked from the start.
 
@@ -16,7 +17,7 @@ Each mode has its own music, colours and best score. Unlike the web version, exp
 | Up / Down | Choose a block in the tray. The first block is selected automatically. |
 | A | Pick up the selected block. It appears just above the tower. |
 | D-pad | Move the held block. Hold to speed up. |
-| L / R | Rotate the held block 45° left or right. |
+| L / R | Rotate the held block 45° left or right. In arcade, a weird block tips toward or away from you instead. |
 | A | Drop the block. A red block overlaps something and can't be dropped. |
 | B | Put the block back in the tray. |
 | Start | Pause. In the pause menu, Select quits to the title screen. |
@@ -68,6 +69,13 @@ The generated assets in `src/gen/` are committed, so Python is only needed if yo
   - The melodies are written out bar by bar. Harmony (broken chords), bass and drums are generated from each song's chord chart.
   - Running `compose.py` writes `music/<song>.mid`, with lead, harmony, bass and drum tracks. `tools/gen_music.py` (part of `make assets`) turns those into note data, and the whole song loops. Per-song voice settings live in `gen_music.py`: duty, envelope, vibrato and bass wave.
   - `tools/stems_to_midi.py` transcribes the original audio (Demucs stems, then basic-pitch) into `music/transcribed/` for reference. It needs demucs, torch, basic-pitch and librosa.
+- **Arcade** follows the web version's rules:
+  - **Special blocks:** magnets (+ attracts −, like charges push apart), sticky (holds on to whatever it touches, the base included), explosive (blows up with every block it touches) and weird (tipped with L and R). A tray slot gets a magnet 10% of the time, sticky or explosive 3% each and weird 2%. The opening tray always has one, and a refill after three plain blocks in a row is always special.
+  - **Conditions:** after a few calm turns (four at the start, then two to four), a condition is announced three turns ahead and then lasts three turns. It is never the same one twice in a row: giant pieces (1.5×), tiny pieces (0.5×), weird rotation, magnet storm, sticky situation or powder keg (everything explosive). The score panel counts down to it, a banner shows it, and the music changes with it (pitched up or down, wobbly, thin and metallic, muffled, or rumbling).
+  - **Piece pool** starts with relaxed's shapes, adds classic's from 10 blocks and expert's from 30.
+  - **Physics:** gravity is 0.85 g, friction 0.9 and restitution almost zero. Magnets use the web version's force law between block outlines (smoothstep falloff, damping along the line between them, capped at 1.5 g). Sticky joints are soft weld constraints, solved as one 3×3 block per weld alongside the contacts. A tipped block is the piece squashed to one cell thick, with its mass unchanged.
+  - **Look:** explosive and weird blocks animate their palettes. The fireball reuses the circle's sprite, so arcade needs no new sprite tiles.
+  - Magnet forces and welds are split into small pieces like the solver's passes, so a big sticky or magnetic pile slows the simulation down instead of dropping frames. Their maths runs as ARM code from ROM, which keeps 64-bit multiplies to one instruction without using IWRAM.
 - **Saves:** the best score for each mode and the last mode picked go to SRAM. An older save keeps its classic best.
 
 ## Testing
@@ -75,6 +83,7 @@ The generated assets in `src/gen/` are committed, so Python is only needed if yo
 - `make test` runs `tests/smoke.txt` headless through libmgba and writes screenshots to `build/shots/`. On Ubuntu, install libmgba with `apt install libmgba-dev`.
 - Script commands are `wait N`, `hold KEYS`, `tap KEYS [N]`, `shot FILE.ppm`, `audio FILE.wav`, and `mark`.
 - `make bench` builds `bench.gba` with a settled 16-block tower. It logs the physics cost per frame to the mGBA debug log.
+- For arcade testing, build with `CFLAGS="... -DARCADE_TEST=N"`. With N from 1 to 6, condition N (giant, tiny, weird, magnet storm, sticky, powder keg) is on from the first turn and never ends. With N from 7 to 11, every block gets one special: 7 magnets of either charge, 8 negative magnets, 9 sticky, 10 explosive, 11 weird.
 - `tools/hostsim/` compiles the physics engine for the host (`-DHOST`), so you can run quick stacking experiments without an emulator:
 
 ```sh

@@ -94,8 +94,19 @@ ObjAttr* oam_alloc(void) { return oam_next < 128 ? &oam_shadow[oam_next++] : 0; 
 void obj_affine_set(int idx, s32 c, s32 s, s32 scale8) {
   ObjAffine* m = (ObjAffine*)oam_shadow + idx;
   /* screen -> texture: R(theta) / scale, Q8 */
-  s32 pa = (c >> 8) * 256 / scale8, ps = (s >> 8) * 256 / scale8;
+  s32 pa = c >> 8, ps = s >> 8;
+  if (scale8 != 256) { pa = pa * 256 / scale8; ps = ps * 256 / scale8; }
   m->pa = pa; m->pb = -ps; m->pc = ps; m->pd = pa;
+}
+
+void obj_affine_set2(int idx, s32 c, s32 s, s32 sx8, s32 sy8) {
+  ObjAffine* m = (ObjAffine*)oam_shadow + idx;
+  /* screen -> texture: S^-1 R(theta)^-1, Q8 */
+  s32 cc = c >> 8, ss = s >> 8, ax = cc, bx = ss, ay = cc, by = ss;   /* divisions are slow: skip them at full size */
+  if (sx8 != 256) { ax = cc * 256 / sx8; bx = ss * 256 / sx8; }
+  if (sy8 == sx8) { ay = ax; by = bx; }
+  else if (sy8 != 256) { ay = cc * 256 / sy8; by = ss * 256 / sy8; }
+  m->pa = ax; m->pb = -bx; m->pc = by; m->pd = ay;
 }
 
 /* ---- text ---- */
