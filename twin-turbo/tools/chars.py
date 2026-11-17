@@ -34,12 +34,12 @@ FRANCO = [
     ".ooHHhhhhhhhhhhhhhho.",
     "..oHHhhhhhhhhhhhhhho.",
     ".oHHHhhhhhhhhhhhhsso.",
-    "oHHHHhhhhhs" "oooo" "s" "oo" "s" "o" ".",
-    ".oHHHhhhsss" "owew" "s" "we" "s" "o" ".",
-    "..oHHhosSss" "owee" "s" "we" "s" "s" "o",
-    "..oHHhosSss" "owee" "s" "we" "s" "s" "o",
-    "..oHHhoSsss" "owee" "s" "oo" "s" "s" "o",
-    "...oHHhosss" "sooo" "s" "ss" "S" "o" ".",
+    "oHHHHhhhhh" "sooos" "s" "os" "s" "o.",
+    ".oHHHhhhss" "owwwo" "s" "wo" "s" "o.",
+    "..oHHhosSs" "oweeo" "s" "eo" "s" "so",
+    "..oHHhosSs" "oweeo" "s" "eo" "s" "so",
+    "..oHHhoSss" "sooos" "s" "os" "s" "so",
+    "...oHHhoss" "ssssss" "ss" "S" "o.",
     "...oHHbbsss" "sssb" "bbbo" "..",
     "....oHbbbss" "ssbm" "ttbo" "..",
     ".....obbbbb" "bbbb" "mmbo" "..",
@@ -58,12 +58,12 @@ TRIPLESET = [
     "ohhHhghhHhghhhHhgghho",
     "ohHhhhhhhhhhhhHhghhgo",
     "ohHhhhhhhhhhhhhsshhho",
-    ".oHhhhhhhhs" "oooo" "s" "oo" "h" "o" ".",
-    "..oHhhhhsss" "owew" "s" "we" "s" "o" ".",
-    "..oHhhosSss" "owee" "s" "we" "s" "s" "o",
-    "..oHhhosSss" "owee" "s" "we" "s" "s" "o",
-    "..oHhhoSsss" "owee" "s" "oo" "s" "s" "o",
-    "...oHhhosss" "sooo" "s" "ss" "S" "o" ".",
+    ".oHhhhhhhh" "sooos" "s" "os" "h" "o.",
+    "..oHhhhhss" "owwwo" "s" "wo" "s" "o.",
+    "..oHhhosSs" "oweeo" "s" "eo" "s" "so",
+    "..oHhhosSs" "oweeo" "s" "eo" "s" "so",
+    "..oHhhoSss" "sooos" "s" "os" "s" "so",
+    "...oHhhoss" "ssssss" "ss" "S" "o.",
     "...oHhhssss" "ssss" "ssso" "..",
     "....oHsssss" "ssss" "mmso" "..",
     ".....osssss" "ssss" "sso." "..",
@@ -154,14 +154,37 @@ def limb(cv, a, b, c, r, fill, shade_col):
     cv.part(m, col)
 
 
+SNEAKER = [            # facing right: ankle collar, toe cap, side stripe, sole
+    "..oooo.....",
+    ".oWWWWooo..",
+    ".oAAWWWWWo.",
+    "oWWAAWWWWWo",
+    "oGGGGGGGGGo",
+    ".ooooooooo.",
+]
+
+
 def shoe(cv, p, ang, far):
-    """big rounded sneaker centred at p, toe toward +x rotated by ang"""
-    m, lx, ly = ellipse_mask((p[0] + 1.2 * math.cos(ang), p[1] + 1.2 * math.sin(ang)), 4.9, 2.6, ang)
-    col = np.full((H, W), SHOE_D if far else SHOE, np.uint8)
-    col[(ly > 1.0)] = SHOE_D if not far else OUT    # sole
-    col[(ly <= 1.0) & (lx > -1.6) & (lx < -0.2)] = ACC  # side stripe
-    col[(ly < -1.3) & (lx > 1.0)] = SHOE if not far else SHOE_D
-    cv.part(m, col)
+    """chunky sneaker; ankle at p. ang > 0 tips the toe down, < 0 lifts it"""
+    cmap = {'o': OUT, 'W': SHOE_D if far else SHOE, 'A': ACC, 'G': OUT if far else SHOE_D}
+    tilt = 1 if ang > 0.15 else -1 if ang < -0.15 else 0
+    x0, y0 = int(p[0] + 0.5) - 4, int(p[1] + 0.5) - 3
+    for y, r in enumerate(SNEAKER):
+        for x, ch in enumerate(r):
+            v = cmap.get(ch)
+            if v is None:
+                continue
+            yy = y0 + y + (tilt if x >= 6 else 0)
+            if 0 <= yy < H and 0 <= x0 + x < W:
+                cv.c[yy, x0 + x] = v
+    if tilt:   # close the seam the shear opens between heel and toe halves
+        for y in range(len(SNEAKER)):
+            a_, b_ = SNEAKER[y][5], SNEAKER[y][6]
+            yy = y0 + y + (tilt if tilt > 0 else 0)
+            if a_ != '.' and b_ != '.' and 0 <= yy < H and 0 <= x0 + 5 < W:
+                v = cmap.get(SNEAKER[y - tilt][5] if 0 <= y - tilt < len(SNEAKER) else 'o', OUT)
+                if cv.c[yy, x0 + 5] == 0:
+                    cv.c[yy, x0 + 5] = v
 
 
 def fist(cv, p, far):
