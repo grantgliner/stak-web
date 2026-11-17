@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Twin Turbo characters, v3 (Sonic Advance style): big hand-pixeled heads with
-large eyes and swoopy hair, on a posed skeleton with thin limbs, chunky fists
-and oversized sneakers. Each body part is drawn with its own outline in
-z-order, so overlapping limbs stay readable. 32x48 frames, facing right."""
+"""Twin Turbo characters: hand-pixeled 3/4 heads (ears, necks, That Franco's
+quiff, beard and roman nose, tripleset's curls and square jaw) on a posed
+skeleton with thin limbs, chunky fists and oversized sneakers. Each body part
+is drawn with its own outline in z-order, so overlapping limbs stay readable.
+32x48 frames, facing right."""
 import math
 import numpy as np
 from PIL import Image
@@ -20,58 +21,60 @@ LOOKS = {
 
 # ---------------------------------------------------------------- heads (facing right)
 # o outline  h hair  H hair dark  g hair light  s skin  S skin shade
-# w eye white  e pupil  b beard  m mouth  t teeth/white
+# w eye white  e pupil  B/b beard  m mouth  t teeth/white  l dark skin line (nostril, lips, ear)
 HEAD_MAP = {'o': OUT, 'h': HAIR, 'H': HAIR_D, 'g': HAIR_L, 's': SKIN, 'S': SKIN_D,
-            'w': SHOE, 'e': OUT, 'b': HAIR, 'm': SKIN_D, 't': SHOE, 'l': EXTRA}
+            'w': SHOE, 'e': OUT, 'b': HAIR_L, 'B': HAIR, 'm': SKIN_D, 't': SHOE, 'l': EXTRA}
 
 FRANCO = [
-    ".......ooooo.........",
-    ".....oohhgghhoo......",
-    "...oohhhhhgggghoo....",
-    "..ohhhhhhhhhggggho...",
-    "oohhhhhhhhhhhhhhhho..",
-    ".oHhhhhhhhhhhhhhhhho.",
-    "ooHHhhhhhhhhhhhhhhho.",
-    ".oHHHhhhhhhsssssssso.",
-    "oHHHhhhhhhsHHHHsHHso.",
-    ".oHHhhhhhhsooosSooso.",
-    "..oHhhhossowwwoSwesso",
-    "..oHhhhoSsoweeoSoosso",
-    "..oHhhhoSsoweeoSSssso",
-    "..oHhhhosssooosSsssSo",
-    "...oHHHbsssssssSlllo.",
-    "...oHHbbbssssbbbbbbo.",
-    "....oHbbbbbbbltttbo..",
-    "....oHHbbbbbbblllbo..",
-    ".....oHbbbbbbbbbbbo..",
-    "......oHbbbbbbbbbo...",
-    ".......obbbbbbbbo....",
-    "........oooooooo.....",
+    "............oooo.....",
+    ".........oooggggo....",
+    ".......oohhhhgggho...",
+    ".....ooHhhHhhhhhggo..",
+    "...ooHhhHhhhhhhhhggo.",
+    "..oHhhHhhhhhHhhhhhgo.",
+    ".oHHhHhhhhHhhhhhhHHo.",
+    "oHHHhHhhhhHhhSSssso..",
+    "oHHHhhHhhHSsssssso...",
+    ".oHHHHhHhshhhHsshhso.",
+    ".oHHHooHhsowwessweso.",
+    "..oHosSohsswwesSsesso",
+    "..oHoslohssssssSsssso",
+    "..oHoSsoBbsssssSsssso",
+    "...oHooBbbbsssSllSSo.",
+    "....oSSBbbbbbbBBBBo..",
+    "....oSSBbbbbbblloBo..",
+    "....oSSBbbbbbbbbbbo..",
+    "....oSSoBbbbbbbbbo...",
+    "....oSSSoBbbbbbbo....",
+    "....oSSSSoBbbbbo.....",
+    "....oSSSSSooooo......",
 ]
 
 TRIPLESET = [
-    ".....ooo.oooo........",
-    "...oohhgohhggoo......",
-    "..ohhhggghhhhgghoo...",
-    ".ohHhhhhhgghhhhhggho.",
-    "ohHhhgghhhhHhggghhho.",
-    "oHhhhhhggghhHhhhgggo.",
-    "oHHhhhhhhhggghhHhhho.",
-    "oHHHhhhhhhhhhhhhhhso.",
-    ".oHhhhhhHssHHHHsHHso.",
-    ".oHhhhhhhhsooosSooso.",
-    "..oHhhhossowwwoSweso.",
-    "..oHhhhoSsoweeoSoosso",
-    "..oHhhhoSsoweeoSssslo",
-    "..oHhhhosssooosSssso.",
-    "...oHhossssssssSsso..",
-    "....ooSssssssslllso..",
-    "......oSssssssssso...",
-    ".......oSssssssso....",
-    "........oSSsssSo.....",
-    ".........oooooo......",
+    ".......oo..ooo.......",
+    ".....oogghoggghoo....",
+    "...oohhhghohhgghhgo..",
+    "..ohgghhhHhhhhHhhggo.",
+    ".oHhhhgHhhhgghhHhhgo.",
+    ".oHhhhhHhhghhhHhhhhgo",
+    "oHHhgghHhhhhhHhgghhho",
+    "oHHhhhHhhHhhSShhhhHo.",
+    ".oHHhHhhHsSsssHhHSso.",
+    ".oHHHhhHhsHHHHssHHso.",
+    ".oHHHooHhsoooessoeso.",
+    "..oHosSohsswwesSwesso",
+    "..oHoslohSsssssSssso.",
+    "..oHoSsoSSssssssSsso.",
+    "...oHooSSSssssSllSo..",
+    "....oSoSSSsssssssso..",
+    "....oSSoSSsssslllso..",
+    "....oSSoSSSsssSSsso..",
+    "....oSSSoSSsssssso...",
+    "....oSSSSooSSSSSo....",
+    "....oSSSSSSoooooo....",
+    "....oSSSSSSSo........",
 ]
-HEAD_NECK = {'franco': (11, 21), 'tripleset': (11, 19)}   # template pixel on the neck top
+HEAD_NECK = {'franco': (10, 21), 'tripleset': (10, 21)}   # template pixel on the neck top
 
 
 def hexc(h):
@@ -271,8 +274,8 @@ def static_pose(kind):
         return dict(hip=(15.0, 30.0), neck=(16.5, 21.5), feet=[((19.5, 41.0), 0.3), ((12.0, 42.0), -0.2)],
                     hands=[(27.0, 29.0), (5.0, 27.0)], head=(0, 0), kbend=1)
     if kind == 'slide':
-        return dict(hip=(12.0, 40.0), neck=(10.5, 31.5), feet=[((27.0, 43.5), -0.1), ((24.0, 43.0), -0.1)],
-                    hands=[(5.0, 41.5), (16.0, 37.0)], head=(-4, 9), kbend=-1)
+        return dict(hip=(14.0, 40.5), neck=(9.0, 34.0), feet=[((27.0, 43.5), -0.1), ((24.0, 43.0), -0.1)],
+                    hands=[(3.5, 43.0), (19.0, 38.5)], head=(0, 0), head_at=(0, 20), head_last=True, kbend=-1)
     raise KeyError(kind)
 
 
@@ -308,29 +311,35 @@ def compose(who, frame):
     shoe(cv, nfoot, nang, False)
     # head
     tpl = FRANCO if who == 'franco' else TRIPLESET
-    hx = int(round(neck[0])) - HEAD_NECK[who][0] + P['head'][0]
-    hy = int(round(neck[1])) - HEAD_NECK[who][1] + P['head'][1]
+    if 'head_at' in P:
+        hx, hy = P['head_at']
+    else:
+        hx = int(round(neck[0])) - HEAD_NECK[who][0] + P['head'][0]
+        hy = int(round(neck[1])) - HEAD_NECK[who][1] + P['head'][1]
     if P.get('face') == 'hurt':
         tpl = hurt_face(tpl)
-    cv.template(tpl, hx, hy, HEAD_MAP)
-    # near arm on top
-    ne = ik(shoulder_near, nhand, UARM, FARM, eb)
-    limb(cv, shoulder_near, ne, nhand, 1.05, SKIN, SKIN_D)
-    # short sleeve cap over the shoulder
-    m, _, _ = ellipse_mask((shoulder_near[0] + 0.3, shoulder_near[1] + 0.8), 2.2, 2.0)
-    cv.part(m, SHIRT)
-    fist(cv, nhand, False)
+
+    def near_arm():
+        ne = ik(shoulder_near, nhand, UARM, FARM, eb)
+        limb(cv, shoulder_near, ne, nhand, 1.05, SKIN, SKIN_D)
+        # short sleeve cap over the shoulder
+        m, _, _ = ellipse_mask((shoulder_near[0] + 0.3, shoulder_near[1] + 0.8), 2.2, 2.0)
+        cv.part(m, SHIRT)
+        fist(cv, nhand, False)
+
+    if P.get('head_last'):          # low poses: the head sits in front of the shoulders
+        near_arm()
+        cv.template(tpl, hx, hy, HEAD_MAP)
+    else:                           # near arm on top
+        cv.template(tpl, hx, hy, HEAD_MAP)
+        near_arm()
     return cv.c
 
 
 def hurt_face(tpl):
-    """squeezed-shut eyes: replace eye whites/pupils with a > shape"""
-    out = []
-    for r in tpl:
-        out.append(r.replace('w', 's').replace('e', 's'))
-    out = [list(r) for r in out]
-    # draw >< style squint at the near eye (cols 12-15, rows 10-12)
-    for (x, y) in ((11, 10), (12, 11), (13, 11), (11, 12)):
+    """squeezed-shut eyes: near eye becomes a > squint, far eye a short line"""
+    out = [list(r.replace('w', 's').replace('e', 's')) for r in tpl]
+    for (x, y) in ((10, 10), (11, 10), (12, 11), (13, 11), (16, 11), (17, 11)):
         out[y][x] = 'o'
     return [''.join(r) for r in out]
 
