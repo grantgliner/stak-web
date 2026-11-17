@@ -1,0 +1,2047 @@
+/* Physics engine. Compiled as ARM code and placed in IWRAM (fast 32-bit bus). */
+#include "physics.h"
+#include "gen/pieces_gen.h"
+_Static_assert(PIECE_MAX_VERTS <= MAX_VERTS, "piece parts have more vertices than physics.h allows");
+_Static_assert(PIECE_MAX_PARTS <= MAX_PARTS, "pieces have more parts than physics.h allows");
+#include "gen/tables_gen.h"
+
+#ifdef HOST
+#define ROM_CODE
+#define ROM_ARM
+#else
+/* cold code: Thumb in ROM (ARM code would fetch 32 bits over the 16-bit cart bus) */
+#define ROM_CODE __attribute__((section(".romcode"), noinline, target("thumb")))
+/* ARM code in ROM, for the arcade's multiply-heavy loops: Thumb has no 64-bit
+   multiply, so every fxmul there would be a library call */
+#define ROM_ARM __attribute__((section(".romcode"), noinline))
+#endif
+
+/* ---- tuning ----------------------------------------------------------
+ * Collide once per frame, then SUBSTEPS x (gravity, warm start, solve with a
+ * Baumgarte push-out, integrate positions, relax without the push) -- the
+ * substepping of Box2D v3 with rigid (non-spring) contacts and a 2-point block
+ * solver. Small blocks under real gravity need the substeps.
+ *
+ * Settled blocks sleep and then count as solid ground for anything that lands on
+ * them (see phys_step section 4), with a static balance check that wakes a
+ * tower when its load no longer sits over its support. That keeps stacks steady
+ * and the per-frame cost down to the handful of blocks actually moving. */
+#define DT        (FX_ONE / 60)
+#ifndef SUBSTEPS
+#define SUBSTEPS  4
+#endif
+#ifndef ITERS
+#if defined(HOST) && defined(HOST_ITERS)
+int phys_iters = 1;
+#define ITERS phys_iters
+#else
+#define ITERS 1
+#endif
+#endif
+#define H24       ((1 << 24) / (60 * SUBSTEPS))   /* substep in Q24 seconds */
+#define H         (FX_ONE / (60 * SUBSTEPS))
+#define INV_H     ((60 * SUBSTEPS) * FX_ONE)
+#define GRAVITY   FX(392.4)        /* 9.81 m/s^2 in cells/s^2 (1 cell = 2.5 cm) */
+static fx gravity = GRAVITY, grav_h = (fx)(((s64)GRAVITY * H + 0x8000) >> 16);   /* arcade: 0.85 g */
+#define MAX_BIAS_VEL FX(60.0)
+#define MAX_VEL   FX(300.0)        /* cells/s; a block dropped from 100 cells up lands at ~280 */
+#define MAX_ANG_VEL FX(40.0)       /* rad/s */
+#ifndef BAUMGARTE
+#define BAUMGARTE 0.2
+#endif
+#define BAUMGARTE_RATE FX(BAUMGARTE * 60 * SUBSTEPS)
+#define LINEAR_SLOP FX(0.02)
+#define MARGIN    FX(0.04)         /* speculative contact distance */
+#define REST      FX(0.25)         /* restitution (Vision Pro classic) */
+static fx friction = FX(0.8), restitution = REST;
+#define REST_VEL  FX(12.0)         /* only bounce above this approach speed */
+#define FRICTION  FX(0.8)
+#define FRICTION_BASE FX(0.9)
+/* Rolling resistance for contacts with a round part: the web version's circles
+   are 48-sided, so they sit still on a slope of up to ~3.75 degrees and slow
+   down as they roll. tan(3.75 deg) = 0.066. */
+#define ROLL_RES  FX(0.066)
+#define SLEEP_LIN2 FX(0.6 * 0.6)
+#define SLEEP_ANG  FX(0.12)
+#ifndef SLEEP_TIME
+#define SLEEP_TIME 30
+#endif
+#define MAX_ARB   512          /* contact manifolds kept between steps */
+#define SUPPORT_NY FX(0.3)       /* contact normal steeper than this = resting on */
+#define IMPACT_WAKE FX(10.0)     /* approach speed that wakes a sleeping body */
+#define CULL_VSLACK FX(20.0)     /* speed a step may add to an approach (gravity alone: 6.5) */
+#define TIP_MARGIN FX(0.0)
+#ifndef MAX_PTS
+#define MAX_PTS   512          /* solver points per step (the first PTS_IW in IWRAM) */
+#endif
+#define PTS_IW    (MAX_PTS < 96 ? MAX_PTS : 96)
+
+Body phys_bodies[MAX_BODIES] EWRAM_BSS;
+BodyVel phys_vel[MAX_BODIES];
+int phys_count, phys_awake, phys_points;
+u32 phys_prof[8];
+#ifdef PROF_FINE   /* bench builds: cycle counts per section from timer 3 */
+extern u32 prof_fine[16];
+#define PF0(v) u16 v = REG_TM3CNT_L
+#define PF1(k, v) prof_fine[k] += (u16)(REG_TM3CNT_L - v)
+#define PFN(k) prof_fine[k]++
+#else
+#define PF0(v)
+#define PF1(k, v)
+#define PFN(k)
+#endif
+#ifdef HOST
+#define PROF(k)
+#else
+#define PROF(k) phys_prof[k] = REG_TM2CNT_L
+#endif
+
+/* Persistent contact manifolds ("arbiters"), EWRAM. Those between two resting
+   bodies stay where they are, step after step, at the front of arbs[]; each step
+   appends the ones it computes for moving bodies. Last step's arbiters of moving
+   bodies are set aside in prev_aw[] for warm starting. */
+typedef struct { u8 a, b, pa, pb; u8 n; s8 up; u16 feat[2]; u8 tm; fx Pn[2], Pt[2]; fx cx[2]; s16 nx, ny; } Arbiter;   /* up: +1 b rests on a, -1 a rests on b; cx, nx/ny (Q14): contact x and normal, for wake_loads; tm: points actually touching, for tip_check */
+static Arbiter arbs[MAX_ARB] EWRAM_BSS, prev_aw[MAX_ARB] EWRAM_BSS;
+static int narb, nprev, ncarried;   /* narb: arbs[] in use; [0, ncarried) were carried over this step */
+static u8 arb_rescan;               /* a body woke or went away: look through all of arbs[] */
+#define ARB_HASH 1024
+static u16 arb_hash[ARB_HASH] EWRAM_BSS;
+
+/* per-step solver data: one SMan per manifold (contact normal, the two bodies,
+   block solver), one SPt per contact point. The first PTS_IW points (and their
+   manifolds) live in fast IWRAM; a big pile-up spills into EWRAM, slower but
+   never dropping contacts, which would let blocks sink into each other and
+   jitter forever. */
+typedef struct {
+  u8 a, b, n, blk;                   /* bodies, points (1-2), use the 2-point block solver */
+  u8 dyn;                            /* bit 0: a moves, bit 1: b moves (else it is ground) */
+  u8 roll; u16 arb;                  /* a round part: rolling resistance (roll_c[arb]); arbiter index */
+  fx nx, ny, fric;
+  fx anx, any, bnx, bny;             /* normal scaled by each body's inverse mass (0 for ground) */
+  fx k11, k12, k22, i11, i12, i22;   /* block solver */
+} SMan;
+typedef struct {
+  fx rn1, rn2, rt1, rt2, kna, knb, kta, ktb;
+  fx mn, mt, Pn, Pt, sep0, vn0, maxPn;
+} SPt;
+#define MAX_MAN (MAX_PTS * 3 / 4)
+#define MAN_IW  (PTS_IW * 2 / 3)      /* resting blocks mostly touch with 2 points */
+static SMan mans[MAN_IW];
+static SPt pts[PTS_IW];
+static SMan mans_x[MAX_MAN - MAN_IW + 1] EWRAM_BSS;
+static SPt pts_x[MAX_PTS - PTS_IW + 1] EWRAM_BSS;
+static int nman, npts;            /* totals this step */
+static int nman_iw, npts_iw;      /* how many of them are in IWRAM (a prefix) */
+static fx body_invM[MAX_BODIES] EWRAM_BSS, body_invI[MAX_BODIES] EWRAM_BSS;
+/* rolling resistance of a manifold with a round part (by arbiter index): an
+   angular impulse on the relative spin, at most lim x the normal impulse */
+typedef struct { fx lim, k, ia, ib, P; } RollC;
+static RollC roll_c[MAX_ARB] EWRAM_BSS;
+/* arcade: per-body shapes, masses, welds, magnets */
+static PhysShape var_shape[MAX_BODIES] EWRAM_BSS;
+static fx body_mass[MAX_BODIES] EWRAM_BSS;
+static u8 wgroup[MAX_BODIES] EWRAM_BSS;          /* weld group (0: none); bodies in one don't collide */
+s8 phys_charge[MAX_BODIES] EWRAM_BSS;
+void (*phys_after_step)(void);
+
+static u8 uf_parent[MAX_BODIES] EWRAM_BSS;
+static u8 wake_req[MAX_BODIES] EWRAM_BSS, wr_list[MAX_BODIES] EWRAM_BSS;   /* wake requests (phys_wake, impacts) */
+static int wr_n;
+static void request_wake(int i) { if (!wake_req[i]) { wake_req[i] = 1; wr_list[wr_n++] = i; } }
+static u8 tip_woke[MAX_BODIES] EWRAM_BSS, tip_ok[MAX_BODIES] EWRAM_BSS;   /* see tip_note_sleep */
+static int nwelds;
+static u8 hook_due EWRAM_BSS, mag_on EWRAM_BSS, arc_stage EWRAM_BSS;   /* the after-step hook is due; magnets acted last step */
+ROM_CODE static int weld_wake(void);
+ROM_CODE static void weld_islands(void);
+
+/* ---- math ------------------------------------------------------------ */
+fx fx_sin(fx a) {
+  s32 t = (s32)(((s64)a * 10680707) >> 16);   /* a * 1024/(2pi), Q16 */
+  int i = (t >> 16) & 1023; s32 f = t & 0xFFFF;
+  s32 s0 = sin_lut[i], s1 = sin_lut[(i + 1) & 1023];
+  return s0 + (s32)(((s64)(s1 - s0) * f) >> 16);
+}
+fx fx_cos(fx a) { return fx_sin(a + FX_PI / 2); }
+
+/* unsigned divide in ARM code from IWRAM: libgcc's runs as Thumb from ROM and
+   costs several times more */
+static u32 udiv32(u32 n, u32 d) {
+  u32 q = 0, bit = 1;
+  while (d < n && !(d & 0x80000000u)) { d <<= 1; bit <<= 1; }
+  do { if (n >= d) { n -= d; q |= bit; } d >>= 1; bit >>= 1; } while (bit);
+  return q;
+}
+
+/* (num << 16) / den for 0 <= num < den < 2^15: a 16-bit quotient, one
+   compare-and-subtract per bit */
+static inline u32 frac16(u32 num, u32 den) {
+  u32 q = 0;
+  if (num >= den) return 0xFFFF;
+#pragma GCC unroll 16
+  for (int k = 0; k < 16; k++) { num <<= 1; q <<= 1; if (num >= den) { num -= den; q |= 1; } }
+  return q;
+}
+
+static inline u32 recip(fx k) {        /* 1/k in Q16, k > 0 (Q16) */
+  if (k <= 2) return 0x7FFFFFFF;
+  return udiv32(0xFFFFFFFFu, (u32)k);
+}
+
+/* ---- geometry -------------------------------------------------------- */
+static void transform_parts(const PiecePart* parts, int nparts, fx px, fx py, fx c, fx s, Poly* out, V2* bmin, V2* bmax) {
+  fx minx = 0x7FFFFFFF, miny = 0x7FFFFFFF, maxx = -0x7FFFFFFF, maxy = -0x7FFFFFFF;
+  for (int p = 0; p < nparts; p++) {
+    const PiecePart* pp = &parts[p];
+    Poly* w = &out[p];
+    w->n = pp->n;
+    fx pminx = 0x7FFFFFFF, pminy = 0x7FFFFFFF, pmaxx = -0x7FFFFFFF, pmaxy = -0x7FFFFFFF;
+    if (pp->n == 1) {           /* circle: centre and radius */
+      fx lx = pp->v[0][0], ly = pp->v[0][1], r = pp->nrm[0][0];
+      fx x = px + (fx)(((s64)c * lx - (s64)s * ly + 0x8000) >> 16);
+      fx y = py + (fx)(((s64)s * lx + (s64)c * ly + 0x8000) >> 16);
+      w->v[0].x = x; w->v[0].y = y; w->nrm[0].x = r; w->nrm[0].y = 0;
+      pminx = x - r; pmaxx = x + r; pminy = y - r; pmaxy = y + r;
+    } else
+    for (int i = 0; i < pp->n; i++) {
+      fx lx = pp->v[i][0], ly = pp->v[i][1];
+      fx x = px + (fx)(((s64)c * lx - (s64)s * ly + 0x8000) >> 16);
+      fx y = py + (fx)(((s64)s * lx + (s64)c * ly + 0x8000) >> 16);
+      w->v[i].x = x; w->v[i].y = y;
+      fx nx = pp->nrm[i][0], ny = pp->nrm[i][1];
+      w->nrm[i].x = (fx)(((s64)c * nx - (s64)s * ny + 0x8000) >> 16);
+      w->nrm[i].y = (fx)(((s64)s * nx + (s64)c * ny + 0x8000) >> 16);
+      if (x < pminx) pminx = x; if (x > pmaxx) pmaxx = x;
+      if (y < pminy) pminy = y; if (y > pmaxy) pmaxy = y;
+    }
+    w->bmin.x = pminx; w->bmin.y = pminy; w->bmax.x = pmaxx; w->bmax.y = pmaxy;
+    if (pminx < minx) minx = pminx; if (pmaxx > maxx) maxx = pmaxx;
+    if (pminy < miny) miny = pminy; if (pmaxy > maxy) maxy = pmaxy;
+  }
+  bmin->x = minx; bmin->y = miny; bmax->x = maxx; bmax->y = maxy;
+}
+
+ROM_CODE int phys_piece_world(int shape, fx x, fx y, fx angle, Poly* polys) {
+  V2 a, b;
+  const PieceDef* d = &piece_defs[shape];
+  transform_parts(d->parts, d->nparts, x, y, fx_cos(angle), fx_sin(angle), polys, &a, &b);
+  return d->nparts;
+}
+ROM_CODE int phys_shape_world(const PhysShape* ps, fx x, fx y, fx angle, Poly* polys) {
+  V2 a, b;
+  transform_parts(ps->parts, ps->nparts, x, y, fx_cos(angle), fx_sin(angle), polys, &a, &b);
+  return ps->nparts;
+}
+
+static void update_body(Body* b) {
+  b->c = fx_cos(b->a); b->s = fx_sin(b->a);
+  const PiecePart* parts = b->var ? var_shape[b - phys_bodies].parts : piece_defs[b->shape].parts;
+  transform_parts(parts, b->nparts, b->p.x, b->p.y, b->c, b->s, b->wp, &b->bmin, &b->bmax);
+}
+
+/* max over edges of A of min separation of B's verts along that edge normal */
+static fx sep_margin = MARGIN;
+/* In 32 bits: normals and coordinates (relative to A's first vertex) in Q12;
+   whatever is tested here lies within a few cells of the other polygon, so the
+   products fit easily. The axis choice and the early out need no more; contact
+   depths are computed exactly afterwards. B's vertices are projected with one
+   multiply-add each per edge (a triangle repeats its last vertex). Q24 inside,
+   Q16 out. */
+static fx max_separation(const Poly* A, const Poly* B, int* edge) {
+  s32 best = -0x7FFFFFFF, lim = sep_margin << 8; int bi = 0, nb = B->n;
+  fx ox = A->v[0].x, oy = A->v[0].y;
+  s32 bx[4], by[4];
+  for (int j = 0; j < 4; j++) { int q = j < nb ? j : nb - 1; bx[j] = (B->v[q].x - ox) >> 4; by[j] = (B->v[q].y - oy) >> 4; }
+  for (int i = 0; i < A->n; i++) {
+    s32 nx = A->nrm[i].x >> 4, ny = A->nrm[i].y >> 4;
+    s32 si = nx * bx[0] + ny * by[0], d;
+    d = nx * bx[1] + ny * by[1]; if (d < si) si = d;
+    d = nx * bx[2] + ny * by[2]; if (d < si) si = d;
+    d = nx * bx[3] + ny * by[3]; if (d < si) si = d;
+    si -= nx * ((A->v[i].x - ox) >> 4) + ny * ((A->v[i].y - oy) >> 4);
+    if (si > best) { best = si; bi = i; if (si > lim) break; }   /* separating axis: done */
+  }
+  *edge = bi;
+  return best >> 8;
+}
+
+typedef struct { V2 p; fx sep; u16 feat; } CPoint;
+typedef struct { V2 n; int count; CPoint c[2]; } Manifold;
+
+static int clip(V2* vin, u8* fin, V2* vout, u8* fout, V2 n, fx off, u8 clipEdge) {
+  int k = 0;
+  fx d0 = fxdot(n, vin[0]) - off, d1 = fxdot(n, vin[1]) - off;
+  if (d0 <= 0) { vout[k] = vin[0]; fout[k++] = fin[0]; }
+  if (d1 <= 0) { vout[k] = vin[1]; fout[k++] = fin[1]; }
+  if ((d0 ^ d1) < 0 && k < 2) {
+    s32 num = d0, den = d0 - d1;
+    if (den < 0) { num = -num; den = -den; }
+    while (den > 0x7FFF) { den >>= 1; num >>= 1; }
+    fx t = !den ? 0 : num < 0 ? -(fx)frac16(-num, den) : (fx)frac16(num, den);
+    vout[k].x = vin[0].x + fxmul(t, vin[1].x - vin[0].x);
+    vout[k].y = vin[0].y + fxmul(t, vin[1].y - vin[0].y);
+    fout[k++] = clipEdge | 0x80;
+  }
+  return k;
+}
+
+/* polygon vs polygon; normal points from A to B */
+static int collide(const Poly* A, const Poly* B, Manifold* m) {
+  int ea, eb;
+  fx sa = max_separation(A, B, &ea);
+  if (sa > sep_margin) return 0;
+  fx sb = max_separation(B, A, &eb);
+  if (sb > sep_margin) return 0;
+  const Poly *P1, *P2; int e1, flip;
+  if (sb > sa + FX(0.005)) { P1 = B; P2 = A; e1 = eb; flip = 1; }
+  else { P1 = A; P2 = B; e1 = ea; flip = 0; }
+  V2 n1 = P1->nrm[e1];
+  /* incident edge: most anti-parallel normal on P2 */
+  int ie = 0; fx mind = 0x7FFFFFFF;
+  for (int i = 0; i < P2->n; i++) {
+    fx d = fxdot(n1, P2->nrm[i]);
+    if (d < mind) { mind = d; ie = i; }
+  }
+  V2 inc[2]; u8 incf[2];
+  inc[0] = P2->v[ie]; int ie2 = ie + 1 == P2->n ? 0 : ie + 1;
+  inc[1] = P2->v[ie2];
+  incf[0] = ie; incf[1] = ie2;
+  V2 v11 = P1->v[e1], v12 = P1->v[(e1 + 1) % P1->n];
+  V2 t = { -n1.y, n1.x };   /* tangent along edge (CCW) */
+  V2 nt = { -t.x, -t.y };
+  V2 c1[2], c2[2]; u8 f1[2], f2[2];
+  if (clip(inc, incf, c1, f1, nt, -fxdot(t, v11), 0x10) < 2) return 0;
+  if (clip(c1, f1, c2, f2, t, fxdot(t, v12), 0x20) < 2) return 0;
+  fx front = fxdot(n1, v11);
+  int k = 0;
+  for (int i = 0; i < 2; i++) {
+    fx sep = fxdot(n1, c2[i]) - front;
+    if (sep <= sep_margin) {
+      m->c[k].p = c2[i]; m->c[k].sep = sep;
+      m->c[k].feat = (u16)(e1 | (f2[i] << 3) | (flip << 15));
+      k++;
+    }
+  }
+  m->n = flip ? (V2){ -n1.x, -n1.y } : n1;
+  m->count = k;
+  /* keep a stable order (along the world tangent) so warm starting can match by index */
+  if (k == 2) {
+    V2 wt = { -m->n.y, m->n.x };
+    if (fxdot(wt, m->c[0].p) > fxdot(wt, m->c[1].p)) { CPoint tmp = m->c[0]; m->c[0] = m->c[1]; m->c[1] = tmp; }
+  }
+  return k;
+}
+
+/* ---- round parts: one contact point, on the circle's surface. Collision runs
+   once per frame and only for round parts, so it lives in ROM to keep IWRAM
+   for the solver. ---- */
+ROM_CODE static u32 isqrt32(u32 x) {
+  u32 r = 0, bit = 1u << 30;
+  while (bit > x) bit >>= 2;
+  while (bit) {
+    if (x >= r + bit) { x -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+    bit >>= 2;
+  }
+  return r;
+}
+/* length of (dx, dy) and the unit vector along it (Q16); 0 if it is too short
+   to have a direction */
+ROM_CODE static fx unit_of(fx dx, fx dy, V2* n) {
+  u64 d2 = (u64)((s64)dx * dx + (s64)dy * dy);   /* Q32 */
+  int sh = 0;
+  while (d2 >= (1ull << 32)) { d2 >>= 2; sh++; }
+  fx len = (fx)(isqrt32((u32)d2) << sh);
+  if (len < 16) return 0;
+  u32 inv = recip(len);
+  n->x = (fx)(((s64)dx * inv + 0x8000) >> 16); n->y = (fx)(((s64)dy * inv + 0x8000) >> 16);
+  return len;
+}
+ROM_CODE static int collide_circles(V2 ca, fx ra, V2 cb, fx rb, Manifold* m) {
+  fx dx = cb.x - ca.x, dy = cb.y - ca.y, lim = ra + rb + sep_margin;
+  if (dx > lim || dx < -lim || dy > lim || dy < -lim) return 0;
+  V2 n = { 0, FX_ONE };
+  fx len = unit_of(dx, dy, &n);
+  if (len > lim) return 0;
+  fx sep = len - ra - rb, k = ra + (sep >> 1);
+  m->n = n; m->count = 1;
+  m->c[0].p.x = ca.x + fxmul(n.x, k); m->c[0].p.y = ca.y + fxmul(n.y, k);
+  m->c[0].sep = sep; m->c[0].feat = 0x4020;
+  return 1;
+}
+/* polygon P vs circle (c, r); normal from P to the circle */
+ROM_CODE static int collide_poly_circle(const Poly* P, V2 c, fx r, Manifold* m) {
+  int np = P->n, bi = 0; fx best = -0x7FFFFFFF;
+  for (int i = 0; i < np; i++) {
+    fx s = fxdot(P->nrm[i], (V2){ c.x - P->v[i].x, c.y - P->v[i].y });
+    if (s > best) { best = s; bi = i; }
+  }
+  fx lim = r + sep_margin;
+  if (best > lim) return 0;
+  V2 v1 = P->v[bi], v2 = P->v[bi + 1 == np ? 0 : bi + 1];
+  V2 n = P->nrm[bi]; fx sep = best - r; u16 f = 0x4000 | bi;
+  if (best > 0) {                    /* centre outside: nearest feature is this face or one of its ends */
+    fx ex = v2.x - v1.x, ey = v2.y - v1.y;
+    const V2* v = 0;
+    if ((s64)(c.x - v1.x) * ex + (s64)(c.y - v1.y) * ey <= 0) { v = &v1; f = 0x4010 | bi; }
+    else if ((s64)(c.x - v2.x) * ex + (s64)(c.y - v2.y) * ey >= 0) { v = &v2; f = 0x4010 | (bi + 1 == np ? 0 : bi + 1); }
+    if (v) {
+      fx len = unit_of(c.x - v->x, c.y - v->y, &n);
+      if (len > lim) return 0;
+      sep = len - r;
+    }
+  }
+  m->n = n; m->count = 1;
+  m->c[0].p.x = c.x - fxmul(n.x, r); m->c[0].p.y = c.y - fxmul(n.y, r);
+  m->c[0].sep = sep; m->c[0].feat = f;
+  return 1;
+}
+/* either part round; normal from A to B */
+ROM_CODE static int collide_round(const Poly* A, const Poly* B, Manifold* m) {
+  if (A->n == 1 && B->n == 1) return collide_circles(A->v[0], A->nrm[0].x, B->v[0], B->nrm[0].x, m);
+  if (B->n == 1) return collide_poly_circle(A, B->v[0], B->nrm[0].x, m);
+  if (!collide_poly_circle(B, A->v[0], A->nrm[0].x, m)) return 0;
+  m->n.x = -m->n.x; m->n.y = -m->n.y; m->c[0].feat |= 0x8000;
+  return 1;
+}
+
+/* the bodies live in EWRAM (slow 16-bit bus); the SAT reads every vertex
+   several times, so work on IWRAM (stack) copies */
+static int collide_fast(const Poly* A, const Poly* B, Manifold* m) {
+  if (A->n == 1 || B->n == 1) return collide_round(A, B, m);
+  Poly a, b;
+  int na = A->n, nb = B->n;
+  a.n = na; b.n = nb;
+  for (int i = 0; i < na; i++) { a.v[i] = A->v[i]; a.nrm[i] = A->nrm[i]; }
+  for (int i = 0; i < nb; i++) { b.v[i] = B->v[i]; b.nrm[i] = B->nrm[i]; }
+  return collide(&a, &b, m);
+}
+
+static inline int aabb_overlap(V2 amin, V2 amax, V2 bmin, V2 bmax, fx m) {
+  return !(amax.x + m < bmin.x || bmax.x + m < amin.x || amax.y + m < bmin.y || bmax.y + m < amin.y);
+}
+
+/* ---- world management ------------------------------------------------ */
+/* broad phase state (see broadphase()) */
+static u8 bp_order[MAX_BODIES] EWRAM_BSS, bp_in[MAX_BODIES] EWRAM_BSS;
+static int bp_n;
+static u8 ph;                      /* step phase, PH_IDLE between steps */
+static u8 bp_dirty;                /* bodies were added or removed */
+ROM_CODE static void body_reset_scratch(int i);
+ROM_CODE void phys_init(void) {
+  for (int i = 0; i < MAX_BODIES; i++) { phys_bodies[i].flags = 0; bp_in[i] = 0; wake_req[i] = 0; phys_charge[i] = 0; wgroup[i] = 0; }
+  nwelds = 0; hook_due = 0; mag_on = 0; arc_stage = 0; phys_after_step = 0;
+  phys_set_params(GRAVITY, FX(0.8), REST);
+  bp_n = 0; ph = 0; wr_n = 0; bp_dirty = 1;
+  phys_count = 0; narb = nprev = ncarried = 0; arb_rescan = 0; npts = 0; nman = 0; nman_iw = npts_iw = 0;
+}
+
+static int alloc_body(void) {
+  for (int i = 0; i < MAX_BODIES; i++) if (!(phys_bodies[i].flags & BODY_USED)) {
+    if (i >= phys_count) phys_count = i + 1;
+    return i;
+  }
+  return -1;
+}
+
+ROM_CODE int phys_add_static_box(fx cx, fx cy, fx hw, fx hh) {
+  int i = alloc_body(); if (i < 0) return -1;
+  bp_dirty = 1;
+  Body* b = &phys_bodies[i];
+  b->flags = BODY_USED | BODY_STATIC; b->shape = 0xFF; b->nparts = 1; b->var = 0;
+  b->p.x = cx; b->p.y = cy; b->a = 0; b->c = FX_ONE; b->s = 0;
+  Poly* p = &b->wp[0]; p->n = 4;
+  p->v[0] = (V2){ cx - hw, cy - hh }; p->v[1] = (V2){ cx + hw, cy - hh };
+  p->v[2] = (V2){ cx + hw, cy + hh }; p->v[3] = (V2){ cx - hw, cy + hh };
+  p->nrm[0] = (V2){ 0, -FX_ONE }; p->nrm[1] = (V2){ FX_ONE, 0 };
+  p->nrm[2] = (V2){ 0, FX_ONE }; p->nrm[3] = (V2){ -FX_ONE, 0 };
+  p->bmin = p->v[0]; p->bmax = p->v[2]; b->bmin = p->v[0]; b->bmax = p->v[2];
+  BodyVel* v = &phys_vel[i]; v->vx = v->vy = v->w = 0; body_invM[i] = 0; body_invI[i] = 0;
+  body_reset_scratch(i);
+  return i;
+}
+
+ROM_CODE int phys_add_piece(int shape, int color, fx x, fx y, fx angle) {
+  int i = alloc_body(); if (i < 0) return -1;
+  bp_dirty = 1;
+  Body* b = &phys_bodies[i];
+  const PieceDef* d = &piece_defs[shape];
+  b->flags = ph ? BODY_USED | BODY_NEW : BODY_USED; b->shape = shape; b->color = color; b->nparts = d->nparts; b->var = 0;
+  b->p.x = x; b->p.y = y; b->a = angle; b->sleepTime = 0; b->frx = b->fry = b->fra = 0;
+  tip_woke[i] = tip_ok[i] = 0;
+  update_body(b);
+  BodyVel* v = &phys_vel[i];
+  v->vx = v->vy = v->w = 0; v->dpx = v->dpy = v->dq = 0;
+  body_invM[i] = recip(d->mass); body_invI[i] = recip(d->inertia); body_mass[i] = d->mass;
+  body_reset_scratch(i);
+  return i;
+}
+
+ROM_CODE int phys_add_shape(const PhysShape* ps, int color, fx x, fx y, fx angle) {
+  int i = phys_add_piece(ps->shape, color, x, y, angle);
+  if (i < 0) return i;
+  Body* b = &phys_bodies[i];
+  var_shape[i] = *ps; b->var = 1; b->nparts = ps->nparts;
+  update_body(b);
+  body_invM[i] = recip(ps->mass); body_invI[i] = recip(ps->inertia); body_mass[i] = ps->mass;
+  return i;
+}
+ROM_CODE const PhysShape* phys_body_shape(int i) { return phys_bodies[i].var ? &var_shape[i] : 0; }
+ROM_CODE fx phys_body_mass(int i) { return body_mass[i]; }
+ROM_CODE void phys_set_params(fx g, fx fr, fx rest) {
+  gravity = g; grav_h = fxmul(g, H); friction = fr; restitution = rest;
+}
+
+ROM_CODE int phys_overlaps(const Poly* polys, int n, fx tol) {
+  V2 mn = polys[0].bmin, mx = polys[0].bmax;
+  for (int k = 1; k < n; k++) {
+    if (polys[k].bmin.x < mn.x) mn.x = polys[k].bmin.x; if (polys[k].bmin.y < mn.y) mn.y = polys[k].bmin.y;
+    if (polys[k].bmax.x > mx.x) mx.x = polys[k].bmax.x; if (polys[k].bmax.y > mx.y) mx.y = polys[k].bmax.y;
+  }
+  for (int i = 0; i < phys_count; i++) {
+    Body* b = &phys_bodies[i];
+    if (!(b->flags & BODY_USED)) continue;
+    if (!aabb_overlap(mn, mx, b->bmin, b->bmax, 0)) continue;
+    for (int k = 0; k < n; k++) for (int p = 0; p < b->nparts; p++) {
+      if (!aabb_overlap(polys[k].bmin, polys[k].bmax, b->wp[p].bmin, b->wp[p].bmax, 0)) continue;
+      int e;
+      sep_margin = MARGIN;
+      if (polys[k].n == 1 || b->wp[p].n == 1) {
+        Manifold m;
+        if (collide_round(&polys[k], &b->wp[p], &m) && m.c[0].sep < -tol) return 1;
+        continue;
+      }
+      if (max_separation(&polys[k], &b->wp[p], &e) > -tol) continue;
+      if (max_separation(&b->wp[p], &polys[k], &e) > -tol) continue;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* ---- stepping -------------------------------------------------------- */
+static inline unsigned arb_key_hash(int a, int b, int pa, int pb) {
+  return ((a * 31 + b) * 7 + pa * 3 + pb * 5) & (ARB_HASH - 1);
+}
+
+ROM_CODE static void build_prev_hash(void) {
+  u32* h32 = (u32*)arb_hash;
+  for (int i = 0; i < ARB_HASH / 2; i++) h32[i] = 0xFFFFFFFFu;
+  for (int i = 0; i < nprev; i++) {
+    Arbiter* r = &prev_aw[i];
+    unsigned h = arb_key_hash(r->a, r->b, r->pa, r->pb);
+    while (arb_hash[h] != 0xFFFF) h = (h + 1) & (ARB_HASH - 1);
+    arb_hash[h] = i;
+  }
+}
+static Arbiter* find_prev(int a, int b, int pa, int pb) {
+  unsigned h = arb_key_hash(a, b, pa, pb);
+  while (arb_hash[h] != 0xFFFF) {
+    Arbiter* r = &prev_aw[arb_hash[h]];
+    if (r->a == a && r->b == b && r->pa == pa && r->pb == pb) return r;
+    h = (h + 1) & (ARB_HASH - 1);
+  }
+  return 0;
+}
+
+static int uf_find(int x) {
+  while (uf_parent[x] != x) { uf_parent[x] = uf_parent[uf_parent[x]]; x = uf_parent[x]; }
+  return x;
+}
+static void uf_union(int a, int b) { a = uf_find(a); b = uf_find(b); if (a != b) uf_parent[a] = b; }
+
+static inline int is_awake_dyn(const Body* b) { return (b->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP | BODY_NEW)) == BODY_USED; }
+
+static inline fx inv_scale(fx x, u32 r, int rs) {
+  s64 v = (s64)x * r;
+  return (fx)(rs >= 0 ? v >> rs : v << -rs);
+}
+
+static SPt* add_points(int ai, int bi, int pa, int pb, const Manifold* m, Arbiter* na, Arbiter* old, Arbiter* out, fx round_r) {
+  Body* A = &phys_bodies[ai]; Body* B = &phys_bodies[bi];
+  BodyVel* va = &phys_vel[ai]; BodyVel* vb = &phys_vel[bi];
+  /* a sleeping body is solid ground for whatever touches it */
+  fx imA = (A->flags & BODY_SLEEP) ? 0 : body_invM[ai], iiA = (A->flags & BODY_SLEEP) ? 0 : body_invI[ai];
+  fx imB = (B->flags & BODY_SLEEP) ? 0 : body_invM[bi], iiB = (B->flags & BODY_SLEEP) ? 0 : body_invI[bi];
+  fx nx = m->n.x, ny = m->n.y;
+  SMan* mn; SPt* s0;
+  if (nman == nman_iw && nman < MAN_IW && npts + m->count <= PTS_IW) {
+    mn = &mans[nman]; s0 = &pts[npts]; nman_iw = nman + 1; npts_iw = npts + m->count;
+  } else { mn = &mans_x[nman - nman_iw]; s0 = &pts_x[npts - npts_iw]; }
+  nman++; npts += m->count;
+  mn->a = ai; mn->b = bi; mn->n = m->count; mn->blk = 0;
+  mn->dyn = (imA ? 1 : 0) | (imB ? 2 : 0);
+  mn->arb = na - out;
+  mn->roll = 0;
+  if (round_r && (iiA | iiB)) {
+    RollC* rc = &roll_c[mn->arb];
+    mn->roll = 1;
+    rc->lim = fxmul(ROLL_RES, round_r); rc->ia = iiA; rc->ib = iiB; rc->k = recip(iiA + iiB); rc->P = 0;
+  }
+  mn->nx = nx; mn->ny = ny;
+  mn->fric = ((A->flags | B->flags) & BODY_STATIC) ? FRICTION_BASE : friction;
+  mn->anx = fxmul(imA, nx); mn->any = fxmul(imA, ny); mn->bnx = fxmul(imB, nx); mn->bny = fxmul(imB, ny);
+  na->tm = 0;
+  for (int k = 0; k < m->count; k++) {
+    SPt* s = s0 + k;
+    fx r1x = m->c[k].p.x - A->p.x, r1y = m->c[k].p.y - A->p.y;
+    fx r2x = m->c[k].p.x - B->p.x, r2y = m->c[k].p.y - B->p.y;
+    /* cross products r x n and r x t, t = (-ny, nx) */
+    s->rn1 = (fx)(((s64)r1x * ny - (s64)r1y * nx + 0x8000) >> 16);
+    s->rn2 = (fx)(((s64)r2x * ny - (s64)r2y * nx + 0x8000) >> 16);
+    s->rt1 = (fx)(((s64)r1x * nx + (s64)r1y * ny + 0x8000) >> 16);
+    s->rt2 = (fx)(((s64)r2x * nx + (s64)r2y * ny + 0x8000) >> 16);
+    s->kna = fxmul(iiA, s->rn1); s->knb = fxmul(iiB, s->rn2);
+    s->kta = fxmul(iiA, s->rt1); s->ktb = fxmul(iiB, s->rt2);
+    s->Pn = 0; s->Pt = 0;
+    if (old) {
+      if (old->n == m->count) { s->Pn = old->Pn[k]; s->Pt = old->Pt[k]; }
+      else for (int j = 0; j < old->n; j++) if (old->feat[j] == m->c[k].feat) { s->Pn = old->Pn[j]; s->Pt = old->Pt[j]; }
+    }
+    na->feat[k] = m->c[k].feat; na->cx[k] = m->c[k].p.x;
+    if (m->c[k].sep <= MARGIN) na->tm |= 1 << k;
+    fx kn = imA + imB + fxmul(s->kna, s->rn1) + fxmul(s->knb, s->rn2);
+    fx kt = imA + imB + fxmul(s->kta, s->rt1) + fxmul(s->ktb, s->rt2);
+    s->mn = recip(kn); s->mt = recip(kt);
+    s->sep0 = m->c[k].sep;
+    s->vn0 = (fx)(((s64)(vb->vx - va->vx) * nx + (s64)(vb->vy - va->vy) * ny + (s64)vb->w * s->rn2 - (s64)va->w * s->rn1 + 0x8000) >> 16);
+    s->maxPn = 0;
+  }
+  na->n = m->count; na->nx = nx >> 2; na->ny = ny >> 2;
+  if (m->count == 2) {
+    SPt* s1 = s0 + 1;
+    fx im = imA + imB;
+    fx k11 = im + fxmul(s0->kna, s0->rn1) + fxmul(s0->knb, s0->rn2);
+    fx k22 = im + fxmul(s1->kna, s1->rn1) + fxmul(s1->knb, s1->rn2);
+    fx k12 = im + fxmul(s0->kna, s1->rn1) + fxmul(s0->knb, s1->rn2);
+    s64 det = (s64)k11 * k22 - (s64)k12 * k12;            /* Q32 */
+    if (det > 0 && (s64)k11 * k11 < det * 500) {
+      mn->blk = 1;
+      mn->k11 = k11; mn->k12 = k12; mn->k22 = k22;
+      /* inverse of K = adj(K) / det. One 32-bit reciprocal of the normalised det
+         (17 significant bits) instead of three 64-bit divisions, which libgcc
+         does in slow Thumb code from ROM */
+      int sh = 0; u64 d = (u64)det;
+      while (d >= (1ull << 31)) { d >>= 1; sh++; }
+      while (d < (1u << 30)) { d <<= 1; sh--; }
+      u32 r = udiv32(0xFFFFFFFFu, (u32)(d >> 15));        /* ~ 2^47 / d */
+      int rs = 15 + sh;                              /* x * 2^32 / det = x * r >> rs */
+      mn->i11 = inv_scale(k22, r, rs);
+      mn->i12 = -inv_scale(k12, r, rs);
+      mn->i22 = inv_scale(k11, r, rs);
+    }
+  }
+  return s0;
+}
+
+/* apply impulse dP along (dx, dy) at a contact; a ground side (inverse mass 0)
+   is skipped, so is a zero impulse (a clamped or idle contact) */
+/* apply impulse dP along the normal (APPLY_N) or the tangent t = (-ny, nx)
+   (APPLY_T): with the normal premultiplied by the inverse masses, three
+   multiplies per moving body */
+#define APPLY_N(m, va, vb, dP, ka, kb) do { fx dP_ = (dP); if (dP_) { \
+    if ((m)->dyn & 1) { (va)->vx -= fxmul(dP_, (m)->anx); (va)->vy -= fxmul(dP_, (m)->any); (va)->w -= fxmul(dP_, ka); } \
+    if ((m)->dyn & 2) { (vb)->vx += fxmul(dP_, (m)->bnx); (vb)->vy += fxmul(dP_, (m)->bny); (vb)->w += fxmul(dP_, kb); } \
+  } } while (0)
+#define APPLY_T(m, va, vb, dP, ka, kb) do { fx dP_ = (dP); if (dP_) { \
+    if ((m)->dyn & 1) { (va)->vx += fxmul(dP_, (m)->any); (va)->vy -= fxmul(dP_, (m)->anx); (va)->w -= fxmul(dP_, ka); } \
+    if ((m)->dyn & 2) { (vb)->vx -= fxmul(dP_, (m)->bny); (vb)->vy += fxmul(dP_, (m)->bnx); (vb)->w += fxmul(dP_, kb); } \
+  } } while (0)
+
+/* the solver passes run over nm manifolds from m (points from s) and return
+   the number of points they used */
+static int warm_start(SMan* m, int nm, SPt* s) {
+  SPt* s0 = s;
+  for (SMan* me = m + nm; m < me; m++) {
+    BodyVel* va = &phys_vel[m->a]; BodyVel* vb = &phys_vel[m->b];
+    for (int k = 0; k < m->n; k++, s++) {
+      APPLY_N(m, va, vb, s->Pn, s->kna, s->knb);
+      APPLY_T(m, va, vb, s->Pt, s->kta, s->ktb);
+    }
+    if (m->roll) {
+      const RollC* rc = &roll_c[m->arb];
+      if (m->dyn & 1) va->w -= fxmul(rc->P, rc->ia);
+      if (m->dyn & 2) vb->w += fxmul(rc->P, rc->ib);
+    }
+  }
+  return s - s0;
+}
+
+/* velocity bias: speculative for gaps, Baumgarte push-out (biased pass only) for overlap.
+   Contacts stay rigid in velocity (no soft spring), so a tall column doesn't sag and
+   buckle; the relax pass strips the push-out velocity again (split-impulse style). */
+static inline fx contact_bias(fx sep, int use_bias) {
+  if (sep > 0) return fxmul(sep, INV_H);
+  if (!use_bias) return 0;
+  fx b = fxmul(BAUMGARTE_RATE, sep + LINEAR_SLOP);
+  if (b > 0) b = 0;
+  if (b < -MAX_BIAS_VEL) b = -MAX_BIAS_VEL;
+  return b;
+}
+
+/* relative motion at a contact along the normal (separation change, Q24 -> Q16;
+   normal velocity) or tangent. A ground body has zero velocity and position
+   change, so its terms are left out: most contacts are a moving block on a
+   sleeping one. */
+static inline fx rel_sep(const SMan* m, const SPt* s, const BodyVel* va, const BodyVel* vb) {
+  fx nx = m->nx, ny = m->ny;
+  if (m->dyn == 2) return (fx)(((s64)vb->dpx * nx + (s64)vb->dpy * ny + (s64)vb->dq * s->rn2 + 0x800000) >> 24);
+  fx ddx = vb->dpx - va->dpx, ddy = vb->dpy - va->dpy;
+  return (fx)(((s64)ddx * nx + (s64)ddy * ny + (s64)vb->dq * s->rn2 - (s64)va->dq * s->rn1 + 0x800000) >> 24);
+}
+static inline fx rel_vn(const SMan* m, const SPt* s, const BodyVel* va, const BodyVel* vb) {
+  fx nx = m->nx, ny = m->ny;
+  if (m->dyn == 2) return (fx)(((s64)vb->vx * nx + (s64)vb->vy * ny + (s64)vb->w * s->rn2 + 0x8000) >> 16);
+  fx dvx = vb->vx - va->vx, dvy = vb->vy - va->vy;
+  return (fx)(((s64)dvx * nx + (s64)dvy * ny + (s64)vb->w * s->rn2 - (s64)va->w * s->rn1 + 0x8000) >> 16);
+}
+static inline fx rel_vt(const SMan* m, const SPt* s, const BodyVel* va, const BodyVel* vb) {
+  fx nx = m->nx, ny = m->ny;
+  if (m->dyn == 2) return (fx)(((s64)vb->vy * nx - (s64)vb->vx * ny + (s64)vb->w * s->rt2 + 0x8000) >> 16);
+  fx dvx = vb->vx - va->vx, dvy = vb->vy - va->vy;
+  return (fx)(((s64)dvy * nx - (s64)dvx * ny + (s64)vb->w * s->rt2 - (s64)va->w * s->rt1 + 0x8000) >> 16);
+}
+
+__attribute__((noinline)) static void solve_block(SMan* m, SPt* s0, BodyVel* va, BodyVel* vb, int use_bias) {
+  SPt* s1 = s0 + 1;
+  fx vn0 = rel_vn(m, s0, va, vb) + contact_bias(s0->sep0 + rel_sep(m, s0, va, vb), use_bias);
+  fx vn1 = rel_vn(m, s1, va, vb) + contact_bias(s1->sep0 + rel_sep(m, s1, va, vb), use_bias);
+  fx a0 = s0->Pn, a1 = s1->Pn;
+  fx b0 = vn0 - fxmul(m->k11, a0) - fxmul(m->k12, a1);
+  fx b1 = vn1 - fxmul(m->k12, a0) - fxmul(m->k22, a1);
+  fx x0, x1;
+  for (;;) {
+    /* both points active: x = -K^-1 b. In 64 bits: with a speculative point
+       (large b) on a badly conditioned pair this overflowed 32 bits and the
+       wrapped result could pass the sign test and fling the body away */
+    s64 X0 = -((s64)m->i11 * b0 + (s64)m->i12 * b1), X1 = -((s64)m->i12 * b0 + (s64)m->i22 * b1);
+    if (X0 >= 0 && X1 >= 0 && X0 < ((s64)1 << 44) && X1 < ((s64)1 << 44)) {
+      x0 = (fx)((X0 + 0x8000) >> 16); x1 = (fx)((X1 + 0x8000) >> 16); break;
+    }
+    x0 = fxmul(-b0, s0->mn); x1 = 0;
+    if (x0 >= 0 && fxmul(m->k12, x0) + b1 >= 0) break;
+    x0 = 0; x1 = fxmul(-b1, s1->mn);
+    if (x1 >= 0 && fxmul(m->k12, x1) + b0 >= 0) break;
+    x0 = 0; x1 = 0;
+    break;
+  }
+  s0->Pn = x0; s1->Pn = x1;
+  if (x0 > s0->maxPn) s0->maxPn = x0;
+  if (x1 > s1->maxPn) s1->maxPn = x1;
+  APPLY_N(m, va, vb, x0 - a0, s0->kna, s0->knb);
+  APPLY_N(m, va, vb, x1 - a1, s1->kna, s1->knb);
+}
+
+/* rolling resistance: hold the relative spin with an angular impulse limited by
+   the normal load (round parts touch at one point) */
+__attribute__((noinline)) static void solve_roll(const SMan* m, const SPt* s, BodyVel* va, BodyVel* vb) {
+  RollC* rc = &roll_c[m->arb];
+  fx lim = fxmul(rc->lim, s->Pn);
+  fx w = ((m->dyn & 2) ? vb->w : 0) - ((m->dyn & 1) ? va->w : 0);
+  fx P0 = rc->P, P = P0 - fxmul(rc->k, w);
+  if (P > lim) P = lim; else if (P < -lim) P = -lim;
+  rc->P = P;
+  fx dP = P - P0;
+  if (!dP) return;
+  if (m->dyn & 1) va->w -= fxmul(dP, rc->ia);
+  if (m->dyn & 2) vb->w += fxmul(dP, rc->ib);
+}
+
+__attribute__((noinline)) static int solve_contacts(SMan* m, int nm, SPt* s0, int use_bias) {
+  /* per manifold: all normal constraints first, then friction (Box2D v3 order).
+     Interleaving normal+friction per point made flat contacts drift sideways. */
+  SPt* sb = s0;
+  for (SMan* me = m + nm; m < me; m++) {
+    BodyVel* va = &phys_vel[m->a]; BodyVel* vb = &phys_vel[m->b];
+    int n = m->n;
+    if (m->blk) solve_block(m, s0, va, vb, use_bias);
+    else for (SPt* s = s0; s < s0 + n; s++) {
+      fx bias = contact_bias(s->sep0 + rel_sep(m, s, va, vb), use_bias);
+      fx imp = -fxmul(s->mn, rel_vn(m, s, va, vb) + bias);
+      fx Pn0 = s->Pn, Pn = Pn0 + imp;
+      if (Pn < 0) Pn = 0;
+      s->Pn = Pn; if (Pn > s->maxPn) s->maxPn = Pn;
+      APPLY_N(m, va, vb, Pn - Pn0, s->kna, s->knb);
+    }
+    for (SPt* s = s0; s < s0 + n; s++) {
+      if (!s->Pn && !s->Pt) continue;           /* no load and no friction yet: nothing to do (exact) */
+      fx maxPt = fxmul(m->fric, s->Pn);
+      fx Pt0 = s->Pt, Pt = Pt0 - fxmul(s->mt, rel_vt(m, s, va, vb));
+      if (Pt > maxPt) Pt = maxPt; else if (Pt < -maxPt) Pt = -maxPt;
+      s->Pt = Pt;
+      APPLY_T(m, va, vb, Pt - Pt0, s->kta, s->ktb);
+    }
+    if (m->roll) solve_roll(m, s0, va, vb);
+    s0 += n;
+  }
+  return s0 - sb;
+}
+
+/* Bodies that just woke up rested on sleeping ones, which never updated the
+   contact impulses between them: those still hold the load from when each body
+   settled, not the weight of everything stacked on it since. Warm-starting a
+   woken column from those makes it sag, bounce and come apart. Instead, seed
+   each woken body's support contacts with its static load: its own mass plus
+   its share of everything resting on it. */
+static u16 wl_start[MAX_BODIES + 1] EWRAM_BSS, wl_list[MAX_ARB] EWRAM_BSS;   /* support arbiters per body */
+static u8 wl_rem[MAX_BODIES] EWRAM_BSS, wl_queue[MAX_BODIES] EWRAM_BSS;
+static fx wl_load[MAX_BODIES] EWRAM_BSS;
+static s64 wl_mx[MAX_BODIES] EWRAM_BSS;
+/* support impulse W (upward, on the upper body) as normal + friction parts */
+ROM_CODE static void wl_seed(Arbiter* r, int c, fx W) {
+  fx nx = (fx)r->nx << 2, ny = (fx)r->ny << 2;
+  if (r->up < 0) { nx = -nx; ny = -ny; }       /* normal from the lower body up */
+  fx pn = fxmul(W, ny), pt = fxmul(W, nx), lim = fxmul(friction, pn);
+  if (pt > lim) pt = lim; else if (pt < -lim) pt = -lim;
+  r->Pn[c] += pn; r->Pt[c] += r->up < 0 ? -pt : pt;
+}
+ROM_CODE static void wake_loads(Arbiter* arbs, int narb, const u8* woke) {
+  /* support lists (arbiters where the body is the upper one), and how many
+     dynamic bodies rest on each body */
+  for (int i = 0; i <= phys_count; i++) wl_start[i] = 0;
+  for (int i = 0; i < phys_count; i++) wl_rem[i] = 0;
+  for (int k = 0; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (!r->up) continue;
+    int lo = r->up > 0 ? r->a : r->b, hi = r->up > 0 ? r->b : r->a;
+    if (phys_bodies[hi].flags & BODY_STATIC) continue;
+    wl_start[hi + 1]++; wl_rem[lo]++;
+  }
+  for (int i = 0; i < phys_count; i++) wl_start[i + 1] += wl_start[i];
+  for (int k = 0; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (!r->up) continue;
+    int hi = r->up > 0 ? r->b : r->a;
+    if (phys_bodies[hi].flags & BODY_STATIC) continue;
+    wl_list[wl_start[hi]++] = k;
+  }
+  for (int i = phys_count; i > 0; i--) wl_start[i] = wl_start[i - 1];
+  wl_start[0] = 0;
+  /* load = own mass + an equal share (per support contact) of the load of each
+     body resting on it, top down: a body is done once everything on it is.
+     (No recursion: a tall column would overflow the small IWRAM stack.) */
+  int qh = 0, qt = 0;
+  for (int i = 0; i < phys_count; i++) {
+    Body* b = &phys_bodies[i];
+    if ((b->flags & (BODY_USED | BODY_STATIC)) != BODY_USED) continue;
+    wl_load[i] = body_mass[i]; wl_mx[i] = (s64)wl_load[i] * b->p.x;
+    if (!wl_rem[i]) wl_queue[qt++] = i;
+  }
+  while (qh < qt) {
+    int u = wl_queue[qh++], ns = wl_start[u + 1] - wl_start[u];
+    if (!ns) continue;
+    fx share = wl_load[u] / ns; s64 mshare = ns == 1 ? wl_mx[u] : wl_mx[u] / ns;
+    for (int q = wl_start[u]; q < wl_start[u + 1]; q++) {
+      Arbiter* r = &arbs[wl_list[q]];
+      int lo = r->up > 0 ? r->a : r->b;
+      if (phys_bodies[lo].flags & BODY_STATIC) continue;
+      wl_load[lo] += share; wl_mx[lo] += mshare;
+      if (!--wl_rem[lo]) wl_queue[qt++] = lo;
+    }
+  }
+  for (int i = 0; i < phys_count; i++) {
+    int s0 = wl_start[i], s1 = wl_start[i + 1];
+    if (!woke[i] || s0 == s1) continue;
+    fx load = wl_load[i], xc = (fx)(wl_mx[i] / load);
+    /* the static split over its support points: lever rule between the
+       outermost two (all of it on one if the centre overhangs) */
+    Arbiter* rmin = 0; Arbiter* rmax = 0; int kmin = 0, kmax = 0;
+    for (int q = s0; q < s1; q++) {
+      Arbiter* r = &arbs[wl_list[q]];
+      for (int c = 0; c < r->n; c++) {
+        r->Pn[c] = 0; r->Pt[c] = 0;
+        if (!rmin || r->cx[c] < rmin->cx[kmin]) { rmin = r; kmin = c; }
+        if (!rmax || r->cx[c] > rmax->cx[kmax]) { rmax = r; kmax = c; }
+      }
+    }
+    fx P = fxmul(load, grav_h);     /* g*H first: load*g overflows Q16 for a tall column */
+    fx x0 = rmin->cx[kmin], x1 = rmax->cx[kmax], p1 = P / 2;
+    if (x1 - x0 >= FX(0.05)) {
+      fx t = (fx)(((s64)(xc - x0) * FX_ONE) / (x1 - x0));
+      if (t < 0) t = 0; else if (t > FX_ONE) t = FX_ONE;
+      p1 = fxmul(P, t);
+    }
+    wl_seed(rmin, kmin, P - p1); wl_seed(rmax, kmax, p1);
+  }
+}
+
+ROM_CODE static void apply_restitution(SMan* m, int nm, SPt* s) {
+  for (SMan* me = m + nm; m < me; m++) {
+    for (int k = 0; k < m->n; k++, s++) {
+      if (s->vn0 > -REST_VEL || s->maxPn == 0) continue;
+      BodyVel* va = &phys_vel[m->a]; BodyVel* vb = &phys_vel[m->b];
+      fx imp = -fxmul(s->mn, rel_vn(m, s, va, vb) + fxmul(restitution, s->vn0));
+      fx Pn0 = s->Pn, Pn = Pn0 + imp; if (Pn < 0) Pn = 0;
+      s->Pn = Pn;
+      APPLY_N(m, va, vb, Pn - Pn0, s->kna, s->knb);
+    }
+  }
+}
+
+ROM_CODE static void wake_body(int i) {
+  Body* b = &phys_bodies[i];
+  arb_rescan = 1;
+  b->flags &= ~BODY_SLEEP; b->sleepTime = 0;
+  phys_vel[i].vx = phys_vel[i].vy = phys_vel[i].w = 0;
+}
+
+/* Static balance test for the sleeping structure, run whenever something falls
+   asleep (i.e. a new block has settled). For every block: does the combined centre
+   of mass of the block and everything stacked on it lie over the span of its
+   support contacts? If not, wake it; the bodies above follow via the wake rule. */
+/* A body the balance test woke that then fell asleep again without moving is
+   held up by something the test can't see (a block leaning on a neighbour, or
+   wedged by its sides). Remember where it rested and leave it alone while it
+   stays there: otherwise it, and everything stacked on it, wakes and re-settles
+   every half second for the rest of the game, which is what made busy towers
+   slow. */
+static fx tip_x[MAX_BODIES] EWRAM_BSS, tip_y[MAX_BODIES] EWRAM_BSS, tip_a[MAX_BODIES] EWRAM_BSS;
+#define TIP_STILL_POS FX(0.05)
+#define TIP_STILL_ANG FX(0.02)
+ROM_CODE static int tip_moved(int i) {
+  const Body* b = &phys_bodies[i];
+  fx dx = b->p.x - tip_x[i], dy = b->p.y - tip_y[i], da = b->a - tip_a[i];
+  return dx > TIP_STILL_POS || dx < -TIP_STILL_POS || dy > TIP_STILL_POS || dy < -TIP_STILL_POS || da > TIP_STILL_ANG || da < -TIP_STILL_ANG;
+}
+ROM_CODE static void tip_note_sleep(int i) {
+  if (tip_woke[i]) { tip_woke[i] = 0; tip_ok[i] = !tip_moved(i); }
+  else if (tip_ok[i] && tip_moved(i)) tip_ok[i] = 0;
+}
+
+static u8 tip_above_n[MAX_BODIES] EWRAM_BSS, tip_above[MAX_BODIES][8] EWRAM_BSS;
+static fx tip_smin[MAX_BODIES] EWRAM_BSS, tip_smax[MAX_BODIES] EWRAM_BSS;
+static u8 tip_sup[MAX_BODIES] EWRAM_BSS, tip_stack[MAX_BODIES] EWRAM_BSS;
+static u16 tip_mark[MAX_BODIES] EWRAM_BSS, tip_gen;   /* visited this generation */
+/* runs once per settle, in pieces: tip_gather() collects each sleeping body's
+   support span and what rests on it, tip_bodies() (below) tests the loads */
+ROM_CODE static void tip_gather(void) {
+  fx* smin = tip_smin; fx* smax = tip_smax; u8* hasSup = tip_sup;
+  for (int i = 0; i < phys_count; i++) { hasSup[i] = 0; tip_above_n[i] = 0; smin[i] = 0x7FFFFFFF; smax[i] = -0x7FFFFFFF; }
+  for (int k = 0; k < narb; k++) {
+    const Arbiter* r = &arbs[k];
+    if (!r->up) continue;
+    int lo = r->up > 0 ? r->a : r->b, hi = r->up > 0 ? r->b : r->a;
+    Body* L = &phys_bodies[lo]; Body* U = &phys_bodies[hi];
+    if (!(U->flags & BODY_SLEEP) || (U->flags & BODY_STATIC) || !r->tm) continue;
+    for (int c = 0; c < r->n; c++) if (r->tm & (1 << c)) {
+      if (r->cx[c] < smin[hi]) smin[hi] = r->cx[c];
+      if (r->cx[c] > smax[hi]) smax[hi] = r->cx[c];
+    }
+    hasSup[hi] = 1;
+    if (!(L->flags & BODY_STATIC) && tip_above_n[lo] < 8) {
+      int dup = 0;
+      for (int q = 0; q < tip_above_n[lo]; q++) if (tip_above[lo][q] == hi) dup = 1;
+      if (!dup) tip_above[lo][tip_above_n[lo]++] = hi;
+    }
+  }
+}
+
+/* ---- broad phase -----------------------------------------------------------
+ * Every body's box (grown by its speculative margin) is kept, sorted by bottom
+ * edge, from step to step: resting bodies don't move, so only the awake ones
+ * are re-boxed and re-sorted (a nearly sorted list: one insertion-sort pass).
+ * Pairs are then looked up around each awake body only, so a tall sleeping
+ * tower costs next to nothing however many blocks it has. */
+#define BP_MAX_CAND 512
+static fx bp_x0[MAX_BODIES] EWRAM_BSS, bp_x1[MAX_BODIES] EWRAM_BSS, bp_y0[MAX_BODIES] EWRAM_BSS, bp_y1[MAX_BODIES] EWRAM_BSS;
+static fx bp_key[MAX_BODIES] EWRAM_BSS;           /* bp_y0 in sorted order */
+static u8 bp_pos[MAX_BODIES] EWRAM_BSS, bp_isaw[MAX_BODIES] EWRAM_BSS;
+static u8 bp_pair[BP_MAX_CAND][2] EWRAM_BSS;
+static int bp_np;
+static fx bp_hmax;                                /* tallest box: how far below a body's bottom to look */
+static u8 aw_list[MAX_BODIES];                    /* awake bodies this step (they are the ones that move) */
+static int aw_n;
+static fx speed[MAX_BODIES] EWRAM_BSS;
+
+static void bp_box(int i) {
+  Body* b = &phys_bodies[i];
+  fx e = (MARGIN + 1) / 2 + fxmul(speed[i], DT) + 1;
+  bp_x0[i] = b->bmin.x - e; bp_x1[i] = b->bmax.x + e; bp_y0[i] = b->bmin.y - e; bp_y1[i] = b->bmax.y + e;
+  if (bp_y1[i] - bp_y0[i] > bp_hmax) bp_hmax = bp_y1[i] - bp_y0[i];
+}
+
+static void bp_sort(void) {
+  for (int k = 1; k < bp_n; k++) {
+    fx y = bp_key[k];
+    if (bp_key[k - 1] <= y) continue;
+    int i = bp_order[k], q = k - 1;
+    while (q >= 0 && bp_key[q] > y) { bp_key[q + 1] = bp_key[q]; bp_order[q + 1] = bp_order[q]; bp_pos[bp_order[q + 1]] = q + 1; q--; }
+    bp_key[q + 1] = y; bp_order[q + 1] = i; bp_pos[i] = q + 1;
+  }
+}
+
+static void bp_add_pair(int i, int j) {
+  if (bp_np >= BP_MAX_CAND) return;
+  if (i > j) { int t = i; i = j; j = t; }
+  bp_pair[bp_np][0] = i; bp_pair[bp_np][1] = j; bp_np++;
+}
+
+static void broadphase(void) {
+  if (bp_dirty) {   /* bodies came or went: rebuild the list */
+    int n = 0, pending = 0;
+    bp_hmax = 0;
+    for (int i = 0; i < phys_count; i++) {
+      u8 f = phys_bodies[i].flags;
+      bp_in[i] = 0;
+      if (!(f & BODY_USED)) continue;
+      if (f & BODY_NEW) { pending = 1; continue; }
+      bp_box(i); bp_in[i] = 1;
+      bp_order[n] = i; bp_key[n] = bp_y0[i]; bp_pos[i] = n; n++;
+    }
+    bp_n = n; bp_dirty = pending;
+  } else
+    for (int k = 0; k < aw_n; k++) { int i = aw_list[k]; bp_box(i); bp_key[bp_pos[i]] = bp_y0[i]; }
+  bp_sort();
+  bp_np = 0;
+  for (int k = 0; k < aw_n; k++) bp_isaw[aw_list[k]] = 1;
+  for (int k = 0; k < aw_n; k++) {
+    int a = aw_list[k], p = bp_pos[a];
+    fx bot = bp_y0[a], top = bp_y1[a], x0 = bp_x0[a], x1 = bp_x1[a];
+    for (int q = p + 1; q < bp_n; q++) {           /* boxes starting above this one's bottom */
+      if (bp_key[q] > top) break;
+      int j = bp_order[q];
+      if (bp_x0[j] > x1 || bp_x1[j] < x0) continue;
+      bp_add_pair(a, j);
+    }
+    fx lim = bot - bp_hmax;
+    for (int q = p - 1; q >= 0; q--) {             /* resting boxes starting below it (awake ones find it themselves) */
+      if (bp_key[q] < lim) break;
+      int j = bp_order[q];
+      if (bp_isaw[j] || bp_y1[j] < bot || bp_x0[j] > x1 || bp_x1[j] < x0) continue;
+      bp_add_pair(a, j);
+    }
+  }
+}
+
+/* ---- the step, in resumable pieces ---------------------------------------
+ * A step is: update moved bodies' geometry, set aside the moving bodies'
+ * contacts and run the broad phase (PRE), narrow phase per candidate pair,
+ * waking + islands (ISL), SUBSTEPS x (gravity, warm start, solve, integrate,
+ * relax), then the end of step (restitution, integrate positions, sleep,
+ * balance check). Each piece is short, so the game can stop at a deadline and
+ * carry on next frame. Positions only change at the end of a step, so whatever
+ * is drawn in between is a whole step. */
+enum { PH_IDLE, PH_UPDATE, PH_CARRY, PH_HASH, PH_BP, PH_NARROW, PH_WAKE, PH_ISL, PH_ARC, PH_SOLVE, PH_PTS,
+       PH_WL, PH_INT, PH_SUP, PH_SLEEP, PH_TIP, PH_TIPB, PH_FIN };
+static int ph_c, ph_mi, ph_pi;
+static u8 ph_sub, ph_pass, ph_it, ph_any, ph_unlimited;
+static u16 ph_deadline;
+static int nwoke;
+static u8 woke[MAX_BODIES] EWRAM_BSS, woke_list[MAX_BODIES] EWRAM_BSS, sup_state[MAX_BODIES] EWRAM_BSS;
+static s16 island_min[MAX_BODIES] EWRAM_BSS;
+/* cost estimates for the pieces whose size is hard to predict: a whole piece
+   (ticks), or a rate per item (1/16 ticks) for pieces that loop over a known
+   count. Each follows the last measurement up at once and down slowly, so one
+   costly step makes the next few careful. */
+static u16 est_hash = 100, est_bp = 300, est_bpd = 600;
+static u16 rate_carry = 6 * 16, rate_wake = 4 * 16, rate_isl = 6 * 16, rate_wl = 20 * 16, rate_sup = 4 * 16, rate_tip = 12 * 16;
+#define EST(rate, n) (16 + (int)(((u32)(n) * (rate)) >> 4))
+
+ROM_CODE static void body_reset_scratch(int i) {
+  woke[i] = 0; wake_req[i] = 0; speed[i] = 0; uf_parent[i] = i; island_min[i] = 0x7FFF; bp_isaw[i] = 0; sup_state[i] = 0;
+}
+
+/* may a piece of about `est` ticks still run before the deadline? The first
+   piece of a call always may (if any time is left), so a step always moves on */
+#ifdef HOST
+static inline int can_run(int est) { (void)est; return 1; }
+static inline u16 tnow(void) { return 0; }
+#else
+static inline u16 tnow(void) { return REG_TM2CNT_L; }
+static int can_run(int est) {
+  if (ph_unlimited) return 1;
+  s16 left = (s16)(ph_deadline - REG_TM2CNT_L);
+  if (!ph_any) { ph_any = 1; return left > 0; }
+  return left >= est;
+}
+#endif
+static inline u16 measured(u16 t0) { u16 d = (u16)(tnow() - t0); return d + (d >> 3) + 8; }
+static u16 track(u16 est, u16 t0) { u16 m = measured(t0); return m > est ? m : est - (est >> 4); }
+static u16 track_rate(u16 rate, u16 t0, int n) {
+  if (n <= 0) return rate;
+  u32 r = ((u32)measured(t0) * 16 + n - 1) / n;
+  if (r > 0xFFFF) r = 0xFFFF;
+  return r > rate ? (u16)r : rate - (rate >> 4);
+}
+
+static SMan* man_at(int mi) { return mi < nman_iw ? &mans[mi] : &mans_x[mi - nman_iw]; }
+static SPt* pt_at(int pi) { return pi < npts_iw ? &pts[pi] : &pts_x[pi - npts_iw]; }
+
+/* is anything going to move? (else a step changes nothing and is skipped) */
+ROM_CODE static int step_needed(void) {
+  if (wr_n) return 1;
+  for (int i = 0; i < phys_count; i++) {
+    u8 f = phys_bodies[i].flags;
+    if ((f & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == BODY_USED) return 1;   /* awake, or new */
+  }
+  return 0;
+}
+
+ROM_CODE static void step_begin(void) {
+  for (int i = 0; i < phys_count; i++) phys_bodies[i].flags &= ~BODY_NEW;
+  npts = nman = nman_iw = npts_iw = 0;
+  aw_n = 0;
+  ph = PH_UPDATE; ph_c = 0;
+}
+
+/* keep resting bodies' contacts where they are, set aside the moving ones'
+   (for warm starting): in pieces of CARRY_CHUNK arbiters */
+#define CARRY_CHUNK 24
+static int ph_w;
+static void carry_begin(void) {
+  int from = arb_rescan ? 0 : ncarried;
+  arb_rescan = 0; nprev = 0; ph_c = ph_w = from;
+}
+__attribute__((noinline)) static int carry_piece(void) {
+  int end = ph_c + CARRY_CHUNK, w = ph_w;
+  if (end > narb) end = narb;
+  for (int k = ph_c; k < end; k++) {
+    Arbiter* r = &arbs[k];
+    Body* A = &phys_bodies[r->a]; Body* B = &phys_bodies[r->b];
+    if (!(A->flags & BODY_USED) || !(B->flags & BODY_USED)) continue;
+    if (is_awake_dyn(A) || is_awake_dyn(B)) { prev_aw[nprev++] = *r; continue; }
+    if (w != k) arbs[w] = *r;
+    w++;
+  }
+  ph_c = end; ph_w = w;
+  if (end < narb) return 0;
+  narb = ncarried = w;
+  return 1;
+}
+
+/* speeds, broad phase */
+__attribute__((noinline)) static void step_bp(void) {
+  for (int k = 0; k < aw_n; k++) {
+    int i = aw_list[k]; BodyVel* v = &phys_vel[i];
+    fx ax = v->vx < 0 ? -v->vx : v->vx, ay = v->vy < 0 ? -v->vy : v->vy, aw = v->w < 0 ? -v->w : v->w;
+    speed[i] = ax + ay + fxmul(aw, FX(2.5)) + fxmul(gravity, DT);
+  }
+  broadphase();
+}
+
+/* narrow phase for one candidate pair, from part pair ph_pp on: 1 done, 0 out
+   of time (ph_pp says where to carry on), -1 the solver is full */
+#define EST_PART_PAIR 180
+static int ph_pp;
+static int narrow_pair(int i, int j) {
+  if (wgroup[i] && wgroup[i] == wgroup[j]) return 1;     /* welded together (arcade) */
+  Body* A = &phys_bodies[i]; Body* B = &phys_bodies[j];
+  /* speculative margin grows with speed so fast drops don't tunnel deep into the
+     stack: with how fast the two could close in on each other (bounded by their
+     relative velocity, plus what the step may add, CULL_VSLACK), so blocks that
+     tumble down together don't collide with everything near them */
+  fx sp = speed[i] + speed[j];
+  {
+    BodyVel* va = &phys_vel[i]; BodyVel* vb = &phys_vel[j];
+    fx dvx = vb->vx - va->vx, dvy = vb->vy - va->vy, wa = va->w, wb = vb->w;
+    fx rel = (dvx < 0 ? -dvx : dvx) + (dvy < 0 ? -dvy : dvy) + fxmul((wa < 0 ? -wa : wa) + (wb < 0 ? -wb : wb), FX(2.5)) + CULL_VSLACK;
+    if (rel < sp) sp = rel;
+  }
+  fx mg = MARGIN + fxmul(sp, DT);
+  PFN(9);
+  V2 Amin = A->bmin, Amax = A->bmax, Bmin = B->bmin, Bmax = B->bmax;
+  if (!aabb_overlap(Amin, Amax, Bmin, Bmax, mg)) return 1;
+  sep_margin = mg;
+  /* part boxes into IWRAM once per pair (EWRAM reads are slow), keeping
+     only parts that reach the other body's box */
+  V2 pmin[2][MAX_PARTS], pmax[2][MAX_PARTS]; unsigned ma = 0, mb = 0;
+  for (int pa = 0; pa < A->nparts; pa++) {
+    pmin[0][pa] = A->wp[pa].bmin; pmax[0][pa] = A->wp[pa].bmax;
+    if (aabb_overlap(pmin[0][pa], pmax[0][pa], Bmin, Bmax, mg)) ma |= 1 << pa;
+  }
+  if (!ma) return 1;
+  for (int pb = 0; pb < B->nparts; pb++) {
+    pmin[1][pb] = B->wp[pb].bmin; pmax[1][pb] = B->wp[pb].bmax;
+    if (aabb_overlap(pmin[1][pb], pmax[1][pb], Amin, Amax, mg)) mb |= 1 << pb;
+  }
+  for (int pa = 0; pa < A->nparts; pa++) if (ma & (1 << pa)) for (int pb = 0; pb < B->nparts; pb++) if (mb & (1 << pb)) {
+    int q = pa * MAX_PARTS + pb;
+    if (q < ph_pp) continue;                       /* done in an earlier piece */
+    PFN(10);
+    if (!aabb_overlap(pmin[0][pa], pmax[0][pa], pmin[1][pb], pmax[1][pb], mg)) continue;
+    /* out of solver points (a huge pile-up): stop, rather than make arbiters
+       whose impulses never get written back */
+    if (npts > MAX_PTS - 2 || nman >= MAX_MAN) return -1;
+    if (!can_run(EST_PART_PAIR)) { ph_pp = q; return 0; }
+    Manifold m;
+    PFN(8);
+    PF0(tc);
+    int hit = collide_fast(&A->wp[pa], &B->wp[pb], &m);
+    PF1(1, tc);
+    if (!hit) continue;
+    /* The speculative margin grows with speed, so in a collapse most points are
+       gaps between blocks that fly past each other: keep only those that could
+       close during this step (approach speed plus CULL_VSLACK for what the step
+       itself adds). Solving the rest cost most of a big pile's time and almost
+       never pushed anything. */
+    {
+      int kk = 0;
+      for (int k = 0; k < m.count; k++) {
+        if (m.c[k].sep > MARGIN) {
+          BodyVel* va = &phys_vel[i]; BodyVel* vb = &phys_vel[j];
+          fx r1x = m.c[k].p.x - A->p.x, r1y = m.c[k].p.y - A->p.y, r2x = m.c[k].p.x - B->p.x, r2y = m.c[k].p.y - B->p.y;
+          fx dvx = vb->vx - fxmul(vb->w, r2y) - va->vx + fxmul(va->w, r1y);
+          fx dvy = vb->vy + fxmul(vb->w, r2x) - va->vy - fxmul(va->w, r1x);
+          fx vn = fxmul(dvx, m.n.x) + fxmul(dvy, m.n.y);
+          if (m.c[k].sep > fxmul((vn < 0 ? -vn : 0) + CULL_VSLACK, DT)) continue;
+        }
+        if (kk != k) m.c[kk] = m.c[k];
+        kk++;
+      }
+      if (!kk) continue;
+      m.count = kk;
+    }
+    if (narb >= MAX_ARB) return -1;
+    Arbiter* na = &arbs[narb++];
+    na->a = i; na->b = j; na->pa = pa; na->pb = pb;
+    na->up = m.n.y > SUPPORT_NY ? 1 : m.n.y < -SUPPORT_NY ? -1 : 0;
+    PF0(tf);
+    Arbiter* old = find_prev(i, j, pa, pb);
+    /* the part pair's reference face (and so its normal) can change between
+       frames: only warm start from impulses along about the same normal */
+    if (old && (s32)old->nx * (m.n.x >> 2) + (s32)old->ny * (m.n.y >> 2) < (s32)(0.9 * (1 << 28))) old = 0;
+    PF1(3, tf);
+    PF0(ta);
+    fx rr = 0;
+    { const Poly* qa = &A->wp[pa]; const Poly* qb = &B->wp[pb];
+      if (qa->n == 1) rr = qa->nrm[0].x;
+      if (qb->n == 1 && (!rr || qb->nrm[0].x < rr)) rr = qb->nrm[0].x; }
+    SPt* sp = add_points(i, j, pa, pb, &m, na, old, arbs, rr);
+    PF1(2, ta);
+    /* a hard hit wakes a sleeping body even from above */
+    for (int k = 0; k < m.count; k++) if (sp[k].vn0 < -IMPACT_WAKE) {
+      if (A->flags & BODY_SLEEP) request_wake(i);
+      if (B->flags & BODY_SLEEP) request_wake(j);
+    }
+  }
+  return 1;
+}
+
+/* waking + islands.
+   Sleeping bodies under an awake one stay asleep and act as static ground: the
+   solver only ever sees the few blocks that are actually moving, which keeps a
+   tall settled tower rock steady and cheap. Anything resting ON an awake body
+   wakes (transitively), a hard impact wakes what it hits, and the balance check (tip_bodies) wakes
+   the part of a sleeping tower whose load no longer sits over its support. */
+static int ph_from, ph_wp;
+/* one wake pass (the first also handles wake requests); 1 when they are over */
+ROM_CODE static int wake_pass(void) {
+  if (ph_wp == 0) {
+    nwoke = 0;
+    for (int k = 0; k < wr_n; k++) {
+      int i = wr_list[k]; wake_req[i] = 0;
+      if ((phys_bodies[i].flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == (BODY_USED | BODY_SLEEP)) { wake_body(i); woke[i] = 1; woke_list[nwoke++] = i; }
+    }
+    wr_n = 0;
+    /* only this step's contacts can have a moving body under a resting one,
+       unless something just woke */
+    ph_from = nwoke ? 0 : ncarried;
+  }
+  int changed = 0;
+  for (int k = ph_from; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    int lo, hi;
+    if (r->up > 0) { lo = r->a; hi = r->b; } else if (r->up < 0) { lo = r->b; hi = r->a; } else continue;
+    Body* L = &phys_bodies[lo]; Body* U = &phys_bodies[hi];
+    if ((L->flags & (BODY_STATIC | BODY_SLEEP)) || !(U->flags & BODY_SLEEP) || (U->flags & BODY_STATIC)) continue;
+    wake_body(hi); woke[hi] = 1; woke_list[nwoke++] = hi; changed = 1;
+  }
+  if (nwelds && weld_wake()) changed = 1;      /* welded bodies wake together */
+  if (changed) ph_from = 0;
+  return !changed || ++ph_wp >= 16;
+}
+/* islands of this step's moving bodies */
+ROM_CODE static void step_islands(void) {
+  for (int k = 0; k < aw_n; k++) {
+    int i = aw_list[k];
+    uf_parent[i] = i; island_min[i] = 0x7FFF;
+    BodyVel* v = &phys_vel[i]; v->dpx = v->dpy = v->dq = 0;
+  }
+  for (int k = 0; k < nwoke; k++) uf_parent[woke_list[k]] = woke_list[k];
+  for (int k = ncarried; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (!is_awake_dyn(&phys_bodies[r->a]) || !is_awake_dyn(&phys_bodies[r->b])) continue;
+    uf_union(r->a, r->b);
+  }
+  if (nwelds) weld_islands();
+}
+
+__attribute__((noinline)) static void step_gravity(void) {
+  fx g = grav_h;
+  for (int k = 0; k < aw_n; k++) phys_vel[aw_list[k]].vy -= g;
+}
+
+__attribute__((noinline)) static void step_integrate_vel(void) {
+  for (int k = 0; k < aw_n; k++) {
+    BodyVel* v = &phys_vel[aw_list[k]];
+    /* safety net: nothing in the game moves this fast, so a body that does
+       came out of a solver glitch and would only fly off the screen */
+    if (v->vx > MAX_VEL) v->vx = MAX_VEL; else if (v->vx < -MAX_VEL) v->vx = -MAX_VEL;
+    if (v->vy > MAX_VEL) v->vy = MAX_VEL; else if (v->vy < -MAX_VEL) v->vy = -MAX_VEL;
+    if (v->w > MAX_ANG_VEL) v->w = MAX_ANG_VEL; else if (v->w < -MAX_ANG_VEL) v->w = -MAX_ANG_VEL;
+    v->dpx += (fx)(((s64)v->vx * H24 + 0x8000) >> 16); v->dpy += (fx)(((s64)v->vy * H24 + 0x8000) >> 16); v->dq += (fx)(((s64)v->w * H24 + 0x8000) >> 16);
+  }
+}
+
+/* ---- end of step, in pieces: positions, sleep, balance check ---- */
+/* integrate positions + sleep bookkeeping for aw_list[k0, k1) */
+ROM_CODE static void integrate_bodies(int k0, int k1) {
+  for (int k = k0; k < k1; k++) {
+    int i = aw_list[k];
+    Body* b = &phys_bodies[i];
+    BodyVel* v = &phys_vel[i];
+    /* dp/dq are Q24: keep the sub-Q16 remainder per body, otherwise slow rotations
+       (w*dt below 1 LSB) never integrate and a tower shears apart while the solver
+       believes it is rotating rigidly */
+    { s32 t;
+      t = v->dpx + b->frx; b->p.x += t >> 8; b->frx = t & 255;
+      t = v->dpy + b->fry; b->p.y += t >> 8; b->fry = t & 255;
+      t = v->dq + b->fra;  b->a += t >> 8;   b->fra = t & 255; }
+    while (b->a > FX_PI) b->a -= 2 * FX_PI;
+    while (b->a < -FX_PI) b->a += 2 * FX_PI;
+    fx ax = v->vx < 0 ? -v->vx : v->vx, ay = v->vy < 0 ? -v->vy : v->vy, aw = v->w < 0 ? -v->w : v->w;
+    if (ax < FX(1) && ay < FX(1) && fxmul(v->vx, v->vx) + fxmul(v->vy, v->vy) < SLEEP_LIN2 && aw < SLEEP_ANG) { if (b->sleepTime < 0x7FFF) b->sleepTime++; }
+    else b->sleepTime = 0;
+    int r = uf_find(i);
+    if (b->sleepTime < island_min[r]) island_min[r] = b->sleepTime;
+  }
+}
+
+/* a still body whose supports are all asleep (or static) can sleep on its own,
+   even while things above it still move: a swaying tower then freezes from the
+   bottom up, so only the part that is actually moving costs anything (and the
+   frozen part is perfectly rigid ground for it). Only this step's contacts
+   can involve a moving body. */
+ROM_CODE static void support_states(void) {
+  for (int k = 0; k < aw_n; k++) sup_state[aw_list[k]] = 0;   /* bit 0: rests on something, bit 1: on something awake */
+#ifndef NO_BOTTOM_SLEEP
+  for (int k = ncarried; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (!r->up) continue;
+    int lo = r->up > 0 ? r->a : r->b, hi = r->up > 0 ? r->b : r->a;
+    sup_state[hi] |= is_awake_dyn(&phys_bodies[lo]) ? 3 : 1;
+  }
+#endif
+}
+
+/* put still islands (and still bodies on resting ground) of aw_list[k0, k1) to sleep */
+ROM_CODE static int sleep_bodies(int k0, int k1) {
+  int slept = 0;
+  for (int k = k0; k < k1; k++) {
+    int i = aw_list[k];
+    Body* b = &phys_bodies[i];
+    bp_isaw[i] = 0;
+    /* a welded body sleeps only with its whole group */
+    if (island_min[uf_find(i)] >= SLEEP_TIME || (b->sleepTime >= SLEEP_TIME && sup_state[i] == 1 && !wgroup[i])) {
+      b->flags |= BODY_SLEEP; phys_vel[i].vx = phys_vel[i].vy = phys_vel[i].w = 0; speed[i] = 0;
+      tip_note_sleep(i);
+      update_body(b);
+      slept = 1;
+    }
+  }
+  return slept;
+}
+
+/* balance test, body by body from ph_c (see tip_gather): does the centre of
+   mass of each sleeping block and everything (transitively) resting on it lie
+   over its support span? The walk up the stack can be long in a tall tower, so
+   it can stop at the deadline and carry on: 1 when all are done */
+#define TIP_NODES 16
+#define EST_TIP_NODES 200          /* ticks for TIP_NODES bodies of the walk */
+static int tip_sp; static s64 tip_mx, tip_mt; static u8 tip_busy;
+ROM_CODE static int tip_bodies(void) {
+  for (; ph_c < phys_count; ph_c++) {
+    int i = ph_c;
+    Body* b = &phys_bodies[i];
+    if (!tip_busy) {
+      if (!tip_sup[i] || (b->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) != (BODY_USED | BODY_SLEEP)) continue;
+      if (wgroup[i]) continue;              /* held up by its welds, not only its contacts */
+      if (!can_run(EST_TIP_NODES)) return 0;
+      if (++tip_gen == 0) { for (int q = 0; q < MAX_BODIES; q++) tip_mark[q] = 0; tip_gen = 1; }
+      tip_sp = 0; tip_stack[tip_sp++] = i; tip_mark[i] = tip_gen;
+      tip_mx = tip_mt = 0; tip_busy = 1;
+    }
+    for (int n = 0; tip_sp; n++) {
+      if (n == TIP_NODES) { if (!can_run(EST_TIP_NODES)) return 0; n = 0; }
+      int c = tip_stack[--tip_sp];
+      fx mass = body_mass[c];
+      tip_mx += (s64)mass * phys_bodies[c].p.x; tip_mt += mass;
+      for (int q = 0; q < tip_above_n[c]; q++) { int u = tip_above[c][q]; if (tip_mark[u] != tip_gen) { tip_mark[u] = tip_gen; tip_stack[tip_sp++] = u; } }
+    }
+    tip_busy = 0;
+    fx comx = (fx)(tip_mx / tip_mt);
+    if ((comx < tip_smin[i] - TIP_MARGIN || comx > tip_smax[i] + TIP_MARGIN) && !tip_ok[i]) {
+      wake_body(i);
+      tip_woke[i] = 1; tip_x[i] = b->p.x; tip_y[i] = b->p.y; tip_a[i] = b->a;
+    }
+  }
+  return 1;
+}
+
+ROM_CODE static void step_finish(void) {
+  for (int k = 0; k < nwoke; k++) woke[woke_list[k]] = 0;
+  phys_awake = aw_n; phys_points = npts;
+}
+
+
+/* ---- arcade: shapes ----------------------------------------------------- */
+ROM_CODE static u32 isqrt64(u64 x) {
+  u64 r = 0, bit = 1ull << 62;
+  while (bit > x) bit >>= 2;
+  while (bit) {
+    if (x >= r + bit) { x -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+    bit >>= 2;
+  }
+  return (u32)r;
+}
+/* outward normals of a CCW polygon from its edges */
+ROM_CODE static void part_normals(PiecePart* pp) {
+  for (int i = 0; i < pp->n; i++) {
+    int j = i + 1 == pp->n ? 0 : i + 1;
+    s32 ex = pp->v[j][0] - pp->v[i][0], ey = pp->v[j][1] - pp->v[i][1];
+    u32 len = isqrt64((u64)((s64)ex * ex + (s64)ey * ey));     /* Q16 */
+    if (!len) len = 1;
+    pp->nrm[i][0] = (s32)(((s64)ey << 16) / len); pp->nrm[i][1] = (s32)(((s64)-ex << 16) / len);
+  }
+}
+ROM_CODE void phys_shape(int shape, int size, int tip, PhysShape* out) {
+  static const fx sizes[3] = { FX(0.5), FX(1.0), FX(1.5) };
+  const PieceDef* d = &piece_defs[shape];
+  fx sc = sizes[size], ky = FX_ONE;
+  if (tip & 1) ky = (fx)(((s64)FX_ONE << 16) / (d->top + d->bottom));   /* one cell thick */
+  if (tip >= 2) ky = -ky;
+  fx sy = fxmul(sc, ky), aky = ky < 0 ? -ky : ky;
+  out->shape = shape; out->size = size; out->tip = tip; out->nparts = d->nparts;
+  out->sx = sc; out->sy = sy;
+  out->sox = fxmul(d->sox, sc); out->soy = fxmul(d->soy, sy);
+  fx top = -0x7FFFFFFF, bot = 0x7FFFFFFF;
+  float area = 0, j2 = 0;
+  for (int p = 0; p < d->nparts; p++) {
+    const PiecePart* in = &d->parts[p];
+    PiecePart* pp = &out->parts[p];
+    if (in->n == 1) {
+      fx cx = fxmul(in->v[0][0], sc), cy = fxmul(in->v[0][1], sy), r = fxmul(in->nrm[0][0], sc);
+      if (aky == FX_ONE) {                      /* still a circle */
+        pp->n = 1; pp->v[0][0] = cx; pp->v[0][1] = cy; pp->nrm[0][0] = r; pp->nrm[0][1] = 0;
+        if (cy + r > top) top = cy + r; if (cy - r < bot) bot = cy - r;
+        float fr = r / 65536.f, fcx = cx / 65536.f, fcy = cy / 65536.f, a = 3.14159265f * fr * fr;
+        area += a; j2 += a * (fr * fr / 2 + fcx * fcx + fcy * fcy);
+        continue;
+      }
+      /* a disc seen edge-on is a slab */
+      fx hw = r, hh = fxmul(r, aky);
+      pp->n = 4;
+      pp->v[0][0] = cx - hw; pp->v[0][1] = cy - hh; pp->v[1][0] = cx + hw; pp->v[1][1] = cy - hh;
+      pp->v[2][0] = cx + hw; pp->v[2][1] = cy + hh; pp->v[3][0] = cx - hw; pp->v[3][1] = cy + hh;
+    } else {
+      pp->n = in->n;
+      for (int i = 0; i < in->n; i++) {
+        int q = ky < 0 ? in->n - 1 - i : i;     /* a flip turns CW: reverse */
+        pp->v[i][0] = fxmul(in->v[q][0], sc); pp->v[i][1] = fxmul(in->v[q][1], sy);
+      }
+    }
+    part_normals(pp);
+    for (int i = 0; i < pp->n; i++) {
+      int k = i + 1 == pp->n ? 0 : i + 1;
+      float x0 = pp->v[i][0] / 65536.f, y0 = pp->v[i][1] / 65536.f, x1 = pp->v[k][0] / 65536.f, y1 = pp->v[k][1] / 65536.f;
+      float cr = x0 * y1 - x1 * y0;
+      area += cr / 2;
+      j2 += cr * (x0 * x0 + x0 * x1 + x1 * x1 + y0 * y0 + y0 * y1 + y1 * y1) / 12;
+      if (pp->v[i][1] > top) top = pp->v[i][1];
+      if (pp->v[i][1] < bot) bot = pp->v[i][1];
+    }
+  }
+  /* the same block, so the same mass (scaled with its size); inertia from the shape */
+  out->mass = fxmul(fxmul(d->mass, sc), sc);
+  if (aky == FX_ONE) out->inertia = fxmul(fxmul(fxmul(fxmul(d->inertia, sc), sc), sc), sc);
+  else out->inertia = (s32)(out->mass / 65536.f * (j2 / area) * 65536.f);
+  out->top = top; out->bottom = -bot;
+}
+
+/* ---- arcade: welds --------------------------------------------------------
+ * A weld holds two bodies' relative position and angle: a 2D point constraint
+ * plus an angle constraint at an anchor between them, solved with the contacts
+ * in every substep (warm started, Baumgarte push-out in the biased pass). A
+ * side that is asleep or static is ground. */
+#define MAX_WELDS 64
+typedef struct {
+  u8 a, b, act, pad;                  /* act: bit 0 a moves, bit 1 b moves this step */
+  fx lax, lay, lbx, lby, ref;         /* anchor in each body's frame; angle b - a when welded */
+  fx Px, Py, Pa;                      /* impulses, kept for warm starting */
+  fx rax, ray, rbx, rby, cx, cy, ca;  /* this step: anchor arms, error at the start */
+  fx ima, imb, iia, iib;
+  fx m11, m12, m13, m22, m23, m33;    /* inverse of the 3x3 effective mass (point and angle together) */
+} Weld;
+static Weld welds[MAX_WELDS] EWRAM_BSS;
+int phys_weld_count(void) { return nwelds; }
+
+ROM_CODE static void weld_groups(void) {
+  static u8 par[MAX_BODIES] EWRAM_BSS, inw[MAX_BODIES] EWRAM_BSS;
+  for (int i = 0; i < MAX_BODIES; i++) { par[i] = i; inw[i] = 0; wgroup[i] = 0; }
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    inw[w->a] = 1;
+    if (phys_bodies[w->b].flags & BODY_STATIC) continue;
+    int a = w->a, b = w->b;
+    while (par[a] != a) a = par[a];
+    while (par[b] != b) b = par[b];
+    if (a != b) par[a] = b;
+    inw[w->a] = inw[w->b] = 1;
+  }
+  for (int i = 0; i < MAX_BODIES; i++) if (inw[i]) { int r = i; while (par[r] != r) r = par[r]; wgroup[i] = r + 1; }
+}
+
+ROM_CODE int phys_weld(int a, int b) {
+  if (a == b || nwelds >= MAX_WELDS) return 0;
+  if (phys_bodies[a].flags & BODY_STATIC) { int t = a; a = b; b = t; }
+  Body* A = &phys_bodies[a]; Body* B = &phys_bodies[b];
+  if (!(A->flags & BODY_USED) || !(B->flags & BODY_USED) || (A->flags & BODY_STATIC)) return 0;
+  if (B->flags & BODY_STATIC) {               /* each block of a group touching the base holds on to it */
+    for (int k = 0; k < nwelds; k++) if (welds[k].b == b && welds[k].a == a) return 0;
+  } else if (wgroup[a] && wgroup[a] == wgroup[b]) return 0;
+  Weld* w = &welds[nwelds++];
+  w->a = a; w->b = b; w->act = 0;
+  fx px = A->p.x + (B->p.x - A->p.x) / 2, py = A->p.y + (B->p.y - A->p.y) / 2;
+  if (B->flags & BODY_STATIC) { px = A->p.x; py = A->p.y; }   /* the base's centre is far away */
+  fx dx = px - A->p.x, dy = py - A->p.y;
+  w->lax = fxmul(A->c, dx) + fxmul(A->s, dy); w->lay = -fxmul(A->s, dx) + fxmul(A->c, dy);
+  dx = px - B->p.x; dy = py - B->p.y;
+  w->lbx = fxmul(B->c, dx) + fxmul(B->s, dy); w->lby = -fxmul(B->s, dx) + fxmul(B->c, dy);
+  w->ref = B->a - A->a;
+  w->Px = w->Py = w->Pa = 0;
+  weld_groups();
+  return 1;
+}
+
+ROM_CODE static void weld_drop(int i) {
+  int n = 0, any = 0;
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    if (w->a == i || w->b == i) { request_wake(w->a == i ? w->b : w->a); any = 1; continue; }
+    if (n != k) welds[n] = *w;
+    n++;
+  }
+  nwelds = n;
+  if (any) weld_groups();
+}
+
+ROM_CODE static int weld_wake(void) {
+  int changed = 0;
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    Body* A = &phys_bodies[w->a]; Body* B = &phys_bodies[w->b];
+    if (is_awake_dyn(A) && (B->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == (BODY_USED | BODY_SLEEP)) {
+      wake_body(w->b); woke[w->b] = 1; woke_list[nwoke++] = w->b; changed = 1;
+    } else if (is_awake_dyn(B) && (A->flags & (BODY_USED | BODY_STATIC | BODY_SLEEP)) == (BODY_USED | BODY_SLEEP)) {
+      wake_body(w->a); woke[w->a] = 1; woke_list[nwoke++] = w->a; changed = 1;
+    }
+  }
+  return changed;
+}
+ROM_CODE static void weld_islands(void) {
+  for (int k = 0; k < nwelds; k++) {
+    Weld* w = &welds[k];
+    if (bp_isaw[w->a] && bp_isaw[w->b]) uf_union(w->a, w->b);
+  }
+}
+
+/* this step's anchor arms, error and inverse effective mass of one weld */
+ROM_ARM static void weld_prepare(Weld* w) {
+  int da = bp_isaw[w->a], db = bp_isaw[w->b];
+  w->act = (da ? 1 : 0) | (db ? 2 : 0);
+  if (!w->act) return;
+  Body* A = &phys_bodies[w->a]; Body* B = &phys_bodies[w->b];
+  w->rax = fxmul(A->c, w->lax) - fxmul(A->s, w->lay); w->ray = fxmul(A->s, w->lax) + fxmul(A->c, w->lay);
+  w->rbx = fxmul(B->c, w->lbx) - fxmul(B->s, w->lby); w->rby = fxmul(B->s, w->lbx) + fxmul(B->c, w->lby);
+  w->cx = B->p.x + w->rbx - A->p.x - w->rax; w->cy = B->p.y + w->rby - A->p.y - w->ray;
+  fx ca = B->a - A->a - w->ref;
+  while (ca > FX_PI) ca -= 2 * FX_PI;
+  while (ca < -FX_PI) ca += 2 * FX_PI;
+  w->ca = ca;
+  w->ima = da ? body_invM[w->a] : 0; w->iia = da ? body_invI[w->a] : 0;
+  w->imb = db ? body_invM[w->b] : 0; w->iib = db ? body_invI[w->b] : 0;
+  /* solving the point and the angle as one 3x3 block (as Box2D's weld joint
+     does) instead of one after the other keeps a light block welded to a
+     heavy one from shaking: the two parts are strongly coupled through its
+     small inertia */
+  fx ma = w->ima + w->imb, ia = w->iia, ib = w->iib;
+  fx k11 = ma + fxmul(ia, fxmul(w->ray, w->ray)) + fxmul(ib, fxmul(w->rby, w->rby));
+  fx k12 = -fxmul(ia, fxmul(w->rax, w->ray)) - fxmul(ib, fxmul(w->rbx, w->rby));
+  fx k13 = -fxmul(ia, w->ray) - fxmul(ib, w->rby);
+  fx k22 = ma + fxmul(ia, fxmul(w->rax, w->rax)) + fxmul(ib, fxmul(w->rbx, w->rbx));
+  fx k23 = fxmul(ia, w->rax) + fxmul(ib, w->rbx);
+  fx k33 = ia + ib;
+  s64 c11 = ((s64)k22 * k33 - (s64)k23 * k23) >> 16, c12 = ((s64)k13 * k23 - (s64)k12 * k33) >> 16;
+  s64 c13 = ((s64)k12 * k23 - (s64)k13 * k22) >> 16, c22 = ((s64)k11 * k33 - (s64)k13 * k13) >> 16;
+  s64 c23 = ((s64)k12 * k13 - (s64)k11 * k23) >> 16, c33 = ((s64)k11 * k22 - (s64)k12 * k12) >> 16;
+  s64 det = k11 * c11 + k12 * c12 + k13 * c13;      /* Q32 */
+  if (det <= 0) { w->act = 0; return; }
+  /* m = c / det in Q16 = c * 2^32 / det: one 16-bit reciprocal of det's top
+     bits instead of six 64-bit divisions (plenty for an iterative solver) */
+  int e = 0; u64 d = (u64)det;
+  while (d >> 24) { d >>= 8; e += 8; }
+  while (d >> 16) { d >>= 1; e++; }
+  if (d < 0x8000) { d = (u64)det << 16 >> e; e -= 16; while (d >> 16) { d >>= 1; e++; } }   /* tiny det: keep 16 bits */
+  u32 r = udiv32(0x80000000u, (u32)d);                 /* 2^31 / top bits */
+  int sh = e - 1;                                       /* c * r * 2^32 / (2^31 * 2^e) */
+#define WMUL(c) (fx)(sh >= 0 ? ((c) * (s64)r) >> sh : ((c) * (s64)r) << -sh)
+  w->m11 = WMUL(c11); w->m12 = WMUL(c12); w->m13 = WMUL(c13);
+  w->m22 = WMUL(c22); w->m23 = WMUL(c23); w->m33 = WMUL(c33);
+#undef WMUL
+}
+ROM_ARM static void weld_impulse(Weld* w, fx px, fx py, fx pa) {
+  if (w->act & 1) {
+    BodyVel* v = &phys_vel[w->a];
+    v->vx -= fxmul(w->ima, px); v->vy -= fxmul(w->ima, py);
+    v->w -= fxmul(w->iia, fxmul(w->rax, py) - fxmul(w->ray, px) + pa);
+  }
+  if (w->act & 2) {
+    BodyVel* v = &phys_vel[w->b];
+    v->vx += fxmul(w->imb, px); v->vy += fxmul(w->imb, py);
+    v->w += fxmul(w->iib, fxmul(w->rbx, py) - fxmul(w->rby, px) + pa);
+  }
+}
+/* Soft constraint (as in Box2D v3): a stiff spring-damper toward the welded
+   pose. Plain Baumgarte plus warm starting pumps energy into a chain of welds;
+   the impulse scale bleeds a little of the accumulated impulse each pass,
+   which keeps long sticky chains stable. 60 Hz, damping ratio 2, 240 Hz substeps. */
+#ifndef WELD_HZ
+#define WELD_HZ 60.0
+#endif
+#ifndef WELD_ZETA
+#define WELD_ZETA 2.0
+#endif
+#define WELD_W   (2 * 3.14159265 * WELD_HZ)
+#define WELD_HW  (WELD_W / (60.0 * SUBSTEPS))
+#define WELD_A   (WELD_HW * (2 * WELD_ZETA + WELD_HW))
+#define WELD_BIAS FX(WELD_W / (2 * WELD_ZETA + WELD_HW))
+#define WELD_MS   FX(WELD_A / (1 + WELD_A))
+#define WELD_IS   FX(1 / (1 + WELD_A))
+static inline fx clamp_bias(fx b) { return b > MAX_BIAS_VEL ? MAX_BIAS_VEL : b < -MAX_BIAS_VEL ? -MAX_BIAS_VEL : b; }
+ROM_ARM static void weld_solve(Weld* w, int use_bias) {
+  static const BodyVel still = { 0, 0, 0, 0, 0, 0 };
+  const BodyVel* va = (w->act & 1) ? &phys_vel[w->a] : &still;
+  const BodyVel* vb = (w->act & 2) ? &phys_vel[w->b] : &still;
+  fx ms = FX_ONE, is = 0, bx = 0, by = 0, ba = 0;
+  if (use_bias) {
+    fx dqa = va->dq >> 8, dqb = vb->dq >> 8;
+    fx ex = w->cx + ((vb->dpx - va->dpx) >> 8) - fxmul(dqb, w->rby) + fxmul(dqa, w->ray);
+    fx ey = w->cy + ((vb->dpy - va->dpy) >> 8) + fxmul(dqb, w->rbx) - fxmul(dqa, w->rax);
+    bx = clamp_bias(fxmul(WELD_BIAS, ex)); by = clamp_bias(fxmul(WELD_BIAS, ey));
+    ba = clamp_bias(fxmul(WELD_BIAS, w->ca + dqb - dqa));
+    ms = WELD_MS; is = WELD_IS;
+  }
+  fx cx = vb->vx - fxmul(vb->w, w->rby) - va->vx + fxmul(va->w, w->ray) + bx;
+  fx cy = vb->vy + fxmul(vb->w, w->rbx) - va->vy - fxmul(va->w, w->rax) + by;
+  fx ca = vb->w - va->w + ba;
+  fx lx = -fxmul(ms, fxmul(w->m11, cx) + fxmul(w->m12, cy) + fxmul(w->m13, ca)) - fxmul(is, w->Px);
+  fx ly = -fxmul(ms, fxmul(w->m12, cx) + fxmul(w->m22, cy) + fxmul(w->m23, ca)) - fxmul(is, w->Py);
+  fx la = -fxmul(ms, fxmul(w->m13, cx) + fxmul(w->m23, cy) + fxmul(w->m33, ca)) - fxmul(is, w->Pa);
+  w->Px += lx; w->Py += ly; w->Pa += la;
+  weld_impulse(w, lx, ly, la);
+}
+
+/* The weld passes, a few welds at a time like the contact passes, so a big
+   sticky pile slows the simulation down instead of running past the frame.
+   what: 0 prepare (before the substeps), 5 warm start, 6 biased, 7 relax (the
+   solver pass numbers they follow). Returns -1 out of time, 0 done, 1 more. */
+#define WELD_CHUNK 6
+static int ph_wk;
+static u16 rate_wprep = 120 * 16, rate_weld = 40 * 16;
+ROM_ARM static int welds_piece(int what) {
+  if (ph_wk >= nwelds) return 0;
+  int end = ph_wk + WELD_CHUNK; if (end > nwelds) end = nwelds;
+  int n = 0;                           /* the welds that move cost; the rest are skipped */
+  for (Weld* w = &welds[ph_wk]; w < &welds[end]; w++) n += what ? w->act != 0 : (bp_isaw[w->a] | bp_isaw[w->b]) != 0;
+  if (!can_run(EST(what ? rate_weld : rate_wprep, n))) return -1;
+  u16 t0 = tnow();
+  for (Weld* w = &welds[ph_wk]; w < &welds[end]; w++) {
+    if (!what) weld_prepare(w);
+    else if (!w->act) continue;
+    else if (what == 5) weld_impulse(w, w->Px, w->Py, w->Pa);
+    else weld_solve(w, what == 6);
+  }
+  if (what) rate_weld = track_rate(rate_weld, t0, n); else rate_wprep = track_rate(rate_wprep, t0, n);
+  ph_wk = end;
+  return 1;
+}
+/* after a weld pass: on to the next solver pass */
+ROM_CODE static void welds_next(void) {
+  ph_wk = 0; ph_mi = ph_pi = 0;
+  if (ph_pass == 5) ph_pass = 2;
+  else if (ph_pass == 6) { if (++ph_it < ITERS) ph_pass = 2; else { ph_it = 0; ph_pass = 3; } }
+  else { ph_pass = 0; ph_sub++; }
+}
+
+/* ---- arcade: magnets ------------------------------------------------------
+ * The web version's magnet force, in block units: within MAG_RANGE (0.035 m)
+ * of each other's outlines, opposite charges pull with up to 0.3 N and like
+ * ones push with half that, eased in with a smoothstep and damped along the
+ * line between them, times the lighter block's mass over a 4-cell block's.
+ * Each block's total is capped at 1.5 g. 1 N on these units is 6024
+ * (cells^2 x cells/s^2, at the web's arcade density of 425 kg/m^3). */
+#define MAG_RANGE FX(1.4)
+#define MAG_PULL  FX(1807.0)
+#define MAG_DAMP  FX(4.52)
+#define MAG_M4    FX(4.0)
+#define MAG_ACC_MAX FX(677.0)
+#define MAX_MAG 24
+static s64 mag_fx[MAX_MAG] EWRAM_BSS, mag_fy[MAX_MAG] EWRAM_BSS;
+static fx mag_gap[MAX_MAG] EWRAM_BSS;
+static u8 mag_list[MAX_MAG] EWRAM_BSS;
+static u8 mag_n EWRAM_BSS, mag_p EWRAM_BSS, mag_q EWRAM_BSS;
+static u16 rate_magpair = 30 * 16;
+
+/* distance from point c to a convex polygon (0 inside) */
+ROM_ARM static fx point_poly_dist(V2 c, const Poly* P) {
+  s64 best = -1; int inside = 1;
+  for (int i = 0; i < P->n; i++) {
+    const V2* a = &P->v[i]; const V2* b = &P->v[i + 1 == P->n ? 0 : i + 1];
+    fx ex = b->x - a->x, ey = b->y - a->y, qx = c.x - a->x, qy = c.y - a->y;
+    if (fxmul(P->nrm[i].x, qx) + fxmul(P->nrm[i].y, qy) > 0) inside = 0;
+    s64 ee = (s64)ex * ex + (s64)ey * ey, qe = (s64)qx * ex + (s64)qy * ey;
+    fx t = qe <= 0 ? 0 : qe >= ee ? FX_ONE : (fx)((qe << 16) / ee);
+    fx dx = qx - fxmul(ex, t), dy = qy - fxmul(ey, t);
+    s64 d2 = (s64)dx * dx + (s64)dy * dy;
+    if (best < 0 || d2 < best) best = d2;
+  }
+  if (inside) return 0;
+  return (fx)isqrt64((u64)best);
+}
+/* gap between two parts. Two polygons use their largest separation along an
+   edge normal (the collision test's own, fast): exact where a corner faces an
+   edge, a little short of the true distance corner to corner, which only
+   strengthens the force there slightly. */
+ROM_ARM static fx part_gap(const Poly* P, const Poly* Q) {
+  if (P->n == 1 && Q->n == 1) {
+    V2 n; fx d = unit_of(Q->v[0].x - P->v[0].x, Q->v[0].y - P->v[0].y, &n) - P->nrm[0].x - Q->nrm[0].x;
+    return d > 0 ? d : 0;
+  }
+  if (P->n == 1) { const Poly* t = P; P = Q; Q = t; }
+  if (Q->n == 1) { fx d = point_poly_dist(Q->v[0], P) - Q->nrm[0].x; return d > 0 ? d : 0; }
+  int e;
+  fx d = max_separation(P, Q, &e);
+  if (d < MAG_RANGE) { fx d2 = max_separation(Q, P, &e); if (d2 > d) d = d2; }
+  return d > 0 ? d : 0;
+}
+ROM_ARM static fx body_gap(const Body* A, const Body* B) {
+  fx best = MAG_RANGE;
+  fx keep = sep_margin; sep_margin = MAG_RANGE;      /* max_separation stops early past this */
+  for (int p = 0; p < A->nparts && best; p++) for (int q = 0; q < B->nparts; q++) {
+    const Poly* P = &A->wp[p]; const Poly* Q = &B->wp[q];
+    if (P->bmin.x - Q->bmax.x >= best || Q->bmin.x - P->bmax.x >= best || P->bmin.y - Q->bmax.y >= best || Q->bmin.y - P->bmax.y >= best) continue;
+    fx d = part_gap(P, Q);
+    if (d < best) { best = d; if (!d) break; }
+  }
+  sep_margin = keep;
+  return best;
+}
+/* one pair's force, added to both bodies' totals */
+ROM_ARM static void magnet_pair(int p, int q) {
+  int i = mag_list[p], j = mag_list[q];
+  const Body* A = &phys_bodies[i]; const Body* B = &phys_bodies[j];
+  fx gap = body_gap(A, B);
+  if (gap >= MAG_RANGE) return;
+  V2 nn;
+  if (!unit_of(B->p.x - A->p.x, B->p.y - A->p.y, &nn)) return;
+  fx c = FX_ONE - fxmul(gap, FX(1.0 / 1.4));         /* 1 - gap / MAG_RANGE */
+  fx l = fxmul(fxmul(c, c), 3 * FX_ONE - 2 * c);
+  const BodyVel* va = &phys_vel[i]; const BodyVel* vb = &phys_vel[j];
+  fx f = fxmul((bp_isaw[j] ? vb->vx : 0) - (bp_isaw[i] ? va->vx : 0), nn.x) + fxmul((bp_isaw[j] ? vb->vy : 0) - (bp_isaw[i] ? va->vy : 0), nn.y);
+  fx damp = fxmul(fxmul(f, MAG_DAMP), l), m;
+  if (phys_charge[i] == phys_charge[j]) {
+    fx e = MAG_PULL / 2;
+    m = -fxmul(e, l) + damp; if (m < -e) m = -e; if (m > 0) m = 0;
+  } else {
+    m = fxmul(MAG_PULL, l) + damp; if (m < 0) m = 0; if (m > MAG_PULL) m = MAG_PULL;
+  }
+  fx mi = body_mass[i], mj = body_mass[j];
+  m = (fx)(((s64)m * (mi < mj ? mi : mj)) / MAG_M4);
+  mag_fx[p] += fxmul(nn.x, m); mag_fy[p] += fxmul(nn.y, m);
+  mag_fx[q] -= fxmul(nn.x, m); mag_fy[q] -= fxmul(nn.y, m);
+  if (gap < mag_gap[p]) mag_gap[p] = gap;
+  if (gap < mag_gap[q]) mag_gap[q] = gap;
+  mag_on = 1;
+}
+/* each body's total, capped, as a velocity change for this step (no 64-bit
+   divisions: they cost more than everything else here together) */
+ROM_ARM static void magnets_apply(void) {
+  fx amax = fxmul(gravity, FX(1.5)); if (amax > MAG_ACC_MAX) amax = MAG_ACC_MAX;
+  for (int k = 0; k < mag_n; k++) {
+    if (!mag_fx[k] && !mag_fy[k]) continue;
+    int i = mag_list[k];
+    fx ax = (fx)((mag_fx[k] * body_invM[i]) >> 16), ay = (fx)((mag_fy[k] * body_invM[i]) >> 16);
+    V2 dir; fx a = unit_of(ax, ay, &dir);
+    if (a > amax) { ax = fxmul(dir.x, amax); ay = fxmul(dir.y, amax); }
+    if (bp_isaw[i]) { phys_vel[i].vx += fxmul(ax, DT); phys_vel[i].vy += fxmul(ay, DT); }
+    else if (mag_gap[k] > FX(0.1) && a > gravity / 4) request_wake(i);   /* pulled hard from a gap */
+  }
+}
+/* The arcade's part of a step, before the solver: magnet forces a pair at a
+   time, then the welds' effective masses a few at a time. Returns -1 out of
+   time, 0 done, 1 more. */
+ROM_CODE static int phys_charge_any(void);
+ROM_CODE static int arc_piece(void) {
+  switch (arc_stage) {
+    case 0:                            /* which bodies have a charge */
+      arc_stage = 3; ph_wk = 0;
+      if (!mag_on && !phys_charge_any()) return 1;
+      if (!can_run(16 + phys_count)) return -1;
+      mag_on = 0; mag_n = 0;
+      for (int i = 0; i < phys_count && mag_n < MAX_MAG; i++)
+        if (phys_charge[i] && (phys_bodies[i].flags & (BODY_USED | BODY_STATIC | BODY_NEW)) == BODY_USED) {
+          mag_fx[mag_n] = mag_fy[mag_n] = 0; mag_gap[mag_n] = MAG_RANGE; mag_list[mag_n++] = i;
+        }
+      if (mag_n >= 2) { arc_stage = 1; mag_p = 0; mag_q = 1; }
+      return 1;
+    case 1:                            /* pairs, as time allows */
+      for (; mag_p < mag_n - 1; mag_p++, mag_q = mag_p + 1) {
+        for (; mag_q < mag_n; mag_q++) {
+          int i = mag_list[mag_p], j = mag_list[mag_q];
+          if (!bp_isaw[i] && !bp_isaw[j]) continue;
+          const Body* A = &phys_bodies[i]; const Body* B = &phys_bodies[j];
+          if (A->bmin.x - B->bmax.x >= MAG_RANGE || B->bmin.x - A->bmax.x >= MAG_RANGE ||
+              A->bmin.y - B->bmax.y >= MAG_RANGE || B->bmin.y - A->bmax.y >= MAG_RANGE) continue;
+          int n = A->nparts * B->nparts;    /* the cost goes with the part pairs to measure */
+          if (!can_run(EST(rate_magpair, n))) return -1;
+          u16 t0 = tnow(); magnet_pair(mag_p, mag_q); rate_magpair = track_rate(rate_magpair, t0, n);
+        }
+      }
+      arc_stage = 2;
+      return 1;
+    case 2:
+      if (!can_run(16 + 24 * mag_n)) return -1;
+      magnets_apply();
+      arc_stage = 3;
+      return 1;
+    default: {                         /* welds */
+      int r = welds_piece(0);
+      if (!r) { arc_stage = 0; ph_wk = 0; }
+      return r;
+    }
+  }
+}
+
+/* ---- arcade: contacts, removal, the between-steps hook ---- */
+ROM_CODE void phys_touching(const u8* flags, PhysPairFn fn) {
+  for (int k = 0; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (!r->tm || !(flags[r->a] | flags[r->b])) continue;
+    if (!(phys_bodies[r->a].flags & BODY_USED) || !(phys_bodies[r->b].flags & BODY_USED)) continue;
+    fn(r->a, r->b);
+  }
+}
+ROM_CODE void phys_remove_wake(int i) {
+  for (int k = 0; k < narb; k++) {
+    Arbiter* r = &arbs[k];
+    if (r->a == i) request_wake(r->b); else if (r->b == i) request_wake(r->a);
+  }
+  phys_remove(i);
+}
+
+#define SOLVE_CHUNK 8      /* manifolds per piece of a solver pass */
+/* ticks per point for a piece of each pass (warm start, solve, relax) */
+static const u8 est_pt[3] = { 3, 12, 11 };
+
+/* one piece of solver pass `pass` (1 warm, 2 solve, 4 relax) from ph_mi/ph_pi:
+   1 done a piece, 0 the pass is over, -1 out of time */
+__attribute__((noinline)) static int solve_piece(int pass) {
+  if (ph_mi >= nman) return 0;
+  int end = ph_mi < nman_iw ? nman_iw : nman;
+  if (end > ph_mi + SOLVE_CHUNK) end = ph_mi + SOLVE_CHUNK;
+  if (!can_run(16 + 2 * SOLVE_CHUNK * est_pt[pass == 1 ? 0 : pass == 2 ? 1 : 2])) return -1;
+  SMan* m = man_at(ph_mi); SPt* s = pt_at(ph_pi); int nm = end - ph_mi, np;
+  if (pass == 1) { PF0(t); np = warm_start(m, nm, s); PF1(6, t); }
+  else if (pass == 2) { PF0(t); np = solve_contacts(m, nm, s, 1); PF1(4, t); }
+  else { PF0(t); np = solve_contacts(m, nm, s, 0); PF1(5, t); }
+  ph_mi = end; ph_pi += np;
+  return 1;
+}
+
+/* restitution and impulses back to the arbiters, a piece at a time like the
+   solver passes */
+ROM_CODE static int pts_piece(void) {
+  if (ph_mi >= nman) return 0;
+  int end = ph_mi < nman_iw ? nman_iw : nman;
+  if (end > ph_mi + SOLVE_CHUNK) end = ph_mi + SOLVE_CHUNK;
+  if (!can_run(16 + 2 * SOLVE_CHUNK * 12)) return -1;
+  SMan* m = man_at(ph_mi); SPt* s = pt_at(ph_pi); SPt* s0 = s; int nm = end - ph_mi;
+  apply_restitution(m, nm, s);
+  for (SMan* me = m + nm; m < me; m++) {
+    Arbiter* r = &arbs[m->arb];
+    for (int k = 0; k < m->n; k++, s++) { r->Pn[k] = s->Pn; r->Pt[k] = s->Pt; }
+  }
+  ph_mi = end; ph_pi += s - s0;
+  return 1;
+}
+
+static u8 ph_slept;
+ROM_CODE static int phys_charge_any(void) {
+  for (int i = 0; i < phys_count; i++) if (phys_charge[i] && (phys_bodies[i].flags & BODY_USED)) return 1;
+  return 0;
+}
+#define INT_CHUNK 16
+#define SLEEP_CHUNK 8
+
+/* work on the step until the deadline; 1 when it is finished. The dispatcher
+   runs from ROM; the pieces that loop over many items are ARM code in IWRAM */
+ROM_CODE static int step_advance(void) {
+  for (;;) switch (ph) {
+    case PH_IDLE: return 1;
+    case PH_UPDATE:
+      PROF(0);
+      for (; ph_c < phys_count; ph_c++) if (is_awake_dyn(&phys_bodies[ph_c])) {
+        if (!can_run(48)) return 0;
+        PF0(t); update_body(&phys_bodies[ph_c]); PF1(7, t);
+        aw_list[aw_n++] = ph_c;
+      }
+      PROF(1);
+      carry_begin(); ph = PH_CARRY; break;
+    case PH_CARRY: {
+      int n = narb - ph_c; if (n > CARRY_CHUNK) n = CARRY_CHUNK;
+      if (!can_run(EST(rate_carry, n))) return 0;
+      u16 t0 = tnow(); int done = carry_piece(); rate_carry = track_rate(rate_carry, t0, n);
+      if (done) ph = PH_HASH;
+      break;
+    }
+    case PH_HASH: {
+      if (!can_run(est_hash)) return 0;
+      u16 t0 = tnow(); build_prev_hash(); est_hash = track(est_hash, t0);
+      ph = PH_BP; break;
+    }
+    case PH_BP: {
+      int dirty = bp_dirty;
+      if (!can_run(dirty ? est_bpd : est_bp)) return 0;
+      u16 t0 = tnow(); step_bp();
+      if (dirty) est_bpd = track(est_bpd, t0); else est_bp = track(est_bp, t0);
+      PROF(2);
+      ph = PH_NARROW; ph_c = 0; ph_pp = 0; break;
+    }
+    case PH_NARROW:
+      for (; ph_c < bp_np; ph_c++, ph_pp = 0) {
+        int i = bp_pair[ph_c][0], j = bp_pair[ph_c][1];
+        if (!ph_pp && !can_run(40)) return 0;
+        int r = narrow_pair(i, j);
+        if (!r) return 0;
+        if (r < 0) break;
+      }
+      PROF(3);
+      ph = PH_WAKE; ph_wp = 0; break;
+    case PH_WAKE: {
+      int n = ph_wp ? narb - ph_from : wr_n ? narb + wr_n : narb - ncarried;
+      if (!can_run(EST(rate_wake, n))) return 0;
+      u16 t0 = tnow(); int done = wake_pass(); rate_wake = track_rate(rate_wake, t0, n);
+      if (done) ph = PH_ISL;
+      break;
+    }
+    case PH_ISL: {
+      int n = aw_n + nwoke + narb - ncarried;
+      if (!can_run(EST(rate_isl, n))) return 0;
+      u16 t0 = tnow(); step_islands(); rate_isl = track_rate(rate_isl, t0, n);
+      PROF(4);
+      ph = PH_ARC; break;
+    }
+    case PH_ARC: {   /* arcade: magnet forces, welds */
+      int r = arc_piece(); if (r < 0) return 0;
+      if (!r) { ph = PH_SOLVE; ph_sub = 0; ph_pass = 0; ph_it = 0; }
+      break;
+    }
+    case PH_SOLVE:
+      if (ph_sub == SUBSTEPS) { ph = PH_PTS; ph_mi = ph_pi = 0; break; }
+      switch (ph_pass) {
+        case 0: if (!can_run(16 + aw_n)) return 0; step_gravity(); ph_pass = 1; ph_mi = ph_pi = 0; break;
+        case 1: { int r = solve_piece(1); if (r < 0) return 0; if (!r) ph_pass = 5; break; }
+        case 2: { int r = solve_piece(2); if (r < 0) return 0;
+                  if (!r) ph_pass = 6; break; }
+        case 3: if (!can_run(16 + 2 * aw_n)) return 0; step_integrate_vel(); ph_pass = 4; ph_mi = ph_pi = 0; break;
+        case 4: { int r = solve_piece(4); if (r < 0) return 0; if (!r) ph_pass = 7; break; }
+        default: { int r = welds_piece(ph_pass); if (r < 0) return 0; if (!r) welds_next(); break; }   /* 5-7: the welds' turn */
+      }
+      break;
+    case PH_PTS: {
+      int r = pts_piece(); if (r < 0) return 0;
+      if (!r) { PROF(5); ph = PH_WL; }
+      break;
+    }
+    case PH_WL:
+#ifndef NO_WAKE_LOAD
+      if (nwoke) {
+        int n = narb + phys_count;
+        if (!can_run(EST(rate_wl, n))) return 0;
+        u16 t0 = tnow(); wake_loads(arbs, narb, woke); rate_wl = track_rate(rate_wl, t0, n);
+      }
+#endif
+      ph = PH_INT; ph_c = 0; break;
+    case PH_INT: {
+      int end = ph_c + INT_CHUNK; if (end > aw_n) end = aw_n;
+      if (!can_run(16 + 24 * (end - ph_c))) return 0;
+      integrate_bodies(ph_c, end); ph_c = end;
+      if (end == aw_n) ph = PH_SUP;
+      break;
+    }
+    case PH_SUP: {
+      int n = aw_n + narb - ncarried;
+      if (!can_run(EST(rate_sup, n))) return 0;
+      u16 t0 = tnow(); support_states(); rate_sup = track_rate(rate_sup, t0, n);
+      ph = PH_SLEEP; ph_c = 0; ph_slept = 0; break;
+    }
+    case PH_SLEEP: {
+      int end = ph_c + SLEEP_CHUNK; if (end > aw_n) end = aw_n;
+      if (!can_run(16 + 72 * (end - ph_c))) return 0;
+      ph_slept |= sleep_bodies(ph_c, end); ph_c = end;
+      if (end == aw_n) ph = ph_slept ? PH_TIP : PH_FIN;
+      break;
+    }
+    case PH_TIP: {
+      int n = narb + phys_count;
+      if (!can_run(EST(rate_tip, n))) return 0;
+      u16 t0 = tnow(); tip_gather(); rate_tip = track_rate(rate_tip, t0, n);
+      ph = PH_TIPB; ph_c = 0; tip_busy = 0; break;
+    }
+    case PH_TIPB:
+      if (!tip_bodies()) return 0;
+      ph = PH_FIN; break;
+    case PH_FIN:
+      if (!can_run(16 + nwoke)) return 0;
+      step_finish();
+      hook_due = 1;
+      PROF(6);
+      ph = PH_IDLE; return 1;
+  }
+}
+
+int phys_busy(void) { return ph != PH_IDLE; }
+
+ROM_CODE int phys_run(u16 deadline, int may_start) {
+  int r = 0;
+  ph_deadline = deadline; ph_any = 0;
+  if (ph == PH_IDLE) {
+    if (!may_start) return 0;
+    if (hook_due) { hook_due = 0; if (phys_after_step) phys_after_step(); }
+    r |= PHYS_STARTED;
+    if (!step_needed()) { phys_awake = 0; phys_points = 0; return r | PHYS_DONE; }   /* all asleep: nothing to do */
+    step_begin();
+  }
+  if (step_advance()) r |= PHYS_DONE;
+  return r;
+}
+
+ROM_CODE void phys_step(void) {
+  ph_unlimited = 1;
+  if (ph != PH_IDLE) step_advance();      /* finish one in progress first */
+  phys_run(0, 1);
+  ph_unlimited = 0;
+}
+
+ROM_CODE void phys_wake(int i) { request_wake(i); }
+
+ROM_CODE void phys_remove(int i) {
+  phys_bodies[i].flags = 0; bp_dirty = 1; arb_rescan = 1; phys_charge[i] = 0;
+  if (nwelds) weld_drop(i);
+}
+#ifdef HOST
+Arbiter* dbg_arbs(int* n) { *n = narb; return arbs; }
+#endif
+#ifdef HOST
+void phys_debug_welds(void) {
+  for (int k = 0; k < nwelds; k++) printf("    weld %d-%d act %d P %.1f,%.1f,%.1f\n", welds[k].a, welds[k].b, welds[k].act, welds[k].Px / 65536.0, welds[k].Py / 65536.0, welds[k].Pa / 65536.0);
+}
+#endif

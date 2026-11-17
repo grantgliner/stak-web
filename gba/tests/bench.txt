@@ -1,0 +1,12 @@
+wait 60
+tap START
+wait 20
+shot build/shots/bench0.ppm
+wait 100
+shot build/shots/bench1.ppm
+tap A
+wait 4
+tap A
+wait 30
+shot build/shots/bench2.ppm
+wait 120
