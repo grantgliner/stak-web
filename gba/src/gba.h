@@ -8,8 +8,13 @@ typedef uint32_t u32; typedef int32_t s32;
 typedef int64_t s64;  typedef uint64_t u64;
 typedef volatile u16 vu16; typedef volatile u32 vu32;
 
+#ifdef N64_PORT   /* the N64 port (../n64) compiles the physics engine as plain C */
+#define IWRAM_CODE
+#define EWRAM_BSS
+#else
 #define IWRAM_CODE __attribute__((section(".iwram"), long_call, noinline))
 #define EWRAM_BSS  __attribute__((section(".sbss")))
+#endif
 #define INLINE static inline __attribute__((always_inline))
 
 #define MEM_IO    0x04000000

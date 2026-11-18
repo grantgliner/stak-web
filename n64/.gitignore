@@ -1,0 +1,6 @@
+build/
+*.z64
+!libdragon/ipl3_dev.z64
+libdragon/src/
+tools/host/stakhost
+tools/host/out/
