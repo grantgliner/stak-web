@@ -1,0 +1,31 @@
+40 0 0
+shot out/title.ppm
+1 0 0 S
+30 0 0
+shot out/play0.ppm
+1 0 0 DL
+10 0 0
+shot out/hover.ppm
+1 0 0 A
+8 0 0
+shot out/lift.ppm
+15 0 0
+shot out/held.ppm
+1 0 0 Z
+12 0.3 0.6
+shot out/held2.ppm
+1 0 0 A
+6 0 0
+shot out/release.ppm
+60 0 0
+shot out/placed.ppm
+1 0 0 DR
+5 0 0
+1 0 0 A
+30 0 0
+shot out/held3.ppm
+30 0 -0.6
+shot out/collide.ppm
+1 0 0 B
+8 0 0
+shot out/return.ppm

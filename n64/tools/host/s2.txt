@@ -1,0 +1,15 @@
+1 0 0 S
+30 0 0
+1 0 0 DL
+5 0 0
+1 0 0 A
+25 0 0
+60 -1 0
+1 0 0 A
+200 0 0
+shot out/over1.ppm
+60 0 0
+shot out/over2.ppm
+1 0 0 B
+40 0 0
+shot out/title2.ppm

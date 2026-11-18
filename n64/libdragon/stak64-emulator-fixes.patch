@@ -1,0 +1,178 @@
+diff --git a/boot/ipl3.c b/boot/ipl3.c
+index 41e4d97..df9570d 100644
+--- a/boot/ipl3.c
++++ b/boot/ipl3.c
+@@ -277,6 +277,20 @@ void stage1(void)
+ 
+     if (!bbplayer && *RI_SELECT == 0) {
+         memsize = rdram_init(mem_bank_init);
++        // STAK64: some emulators (mupen64plus) misreport the chip count during
++        // RDRAM init. Verify each 2 MiB bank with a write/readback and clamp.
++        {
++            int verified = 0;
++            for (int cid=0; cid<8; cid+=2) {
++                volatile uint32_t *ptr = (void*)0xA0000000 + cid * 1024 * 1024 + 0x100000;
++                ptr[0]=0x12345678;
++                if (ptr[0] != 0x12345678) break;
++                ptr[0]=0;
++                verified += 2*1024*1024;
++            }
++            if (memsize == 0 || verified < memsize) memsize = verified;
++            if (memsize < 0x400000) memsize = 0x400000;
++        }
+     } else {
+         if (bbplayer) {
+             // iQue doesn't have a IPL2 and the OS provides boot flags already in lowmem.
+diff --git a/include/emux.h b/include/emux.h
+index 076391b..f743344 100644
+--- a/include/emux.h
++++ b/include/emux.h
+@@ -172,14 +172,10 @@ inline uint32_t emux_detect(int subcode)
+      *  1) encode the instruction to write into a fixed scratch GPR (here: t0)
+      *  2) copy the scratch GPR into a GCC output register
+      */
+-    const int REG_T0 = 8;
+-    register uint64_t result asm("t0") = 0;
+-
+-    __asm__ __volatile__(
+-        " .word %1\n"
+-        : "+r"(result) : "i"(EMUX_XDETECT(REG_T0, subcode)) : "memory");
+-
+-    return result;
++    // STAK64: EMUX opcodes hang mupen64plus (EmulatorJS) cached interpreter.
++    // Report no EMUX support so no EMUX opcode is ever executed.
++    (void)subcode;
++    return 0;
+ }
+ 
+ /**
+diff --git a/include/n64sys.h b/include/n64sys.h
+index 4a4c874..0587aa9 100644
+--- a/include/n64sys.h
++++ b/include/n64sys.h
+@@ -119,7 +119,7 @@ extern int __boot_tvtype;
+  * 
+  * @return A 64-bit virtual address to access the physical address
+  */
+- #define VirtualUncachedAddr64(_addr) ((vaddr64_t)(((_addr))|0x9000000000000000ull))
++ #define VirtualUncachedAddr64(_addr) ((vaddr64_t)((uint64_t)(_addr) < 0x20000000ull ? (0xFFFFFFFFA0000000ull | (uint64_t)(_addr)) : (((uint64_t)(_addr))|0x9000000000000000ull)))  /* STAK64: KSEG1 when possible (mupen64plus lacks XKPHYS) */
+ 
+ /**
+  * @brief Return the uncached memory address for a given virtual address
+diff --git a/src/entropy.c b/src/entropy.c
+index f589eb1..79f9f9e 100644
+--- a/src/entropy.c
++++ b/src/entropy.c
+@@ -54,12 +54,12 @@ void __entropy_add(uint64_t k) {
+ 
+ /** @brief Registers used to pull entropy from */
+ volatile uint32_t* __entropy_regs[] = {
+-    (uint32_t*)0xA3F00200, // RI_BANK0_ROW
+-    (uint32_t*)0xA3F00600, // RI_BANK1_ROW
++    (uint32_t*)0xA4400010, // STAK64: VI_CURRENT (RI_BANK0_ROW unsupported in mupen)
++    (uint32_t*)0xA4100010, // STAK64: DP_CLOCK
+     (uint32_t*)0xA450000C, // AI_STATUS
+     (uint32_t*)0xA4080000, // SP_PC
+     (uint32_t*)0xA4100010, // DP_CLOCK
+-    (uint32_t*)0xA4600034, // PI_UNKNOWN
++    (uint32_t*)0xA4400010, // STAK64: VI_CURRENT
+ };
+ 
+ // Since libdragon doesn't call __entropy_add() enough for now, let's always
+@@ -93,7 +93,7 @@ __attribute__((noinline))
+ static void reseed_from_entropy(void) {
+     __entropy_add_internal();
+     uint64_t e = __entropy_get();
+-    atomic_fetch_xor_explicit(&xs_state, e, memory_order_relaxed);
++    { uint32_t sr = __disable_interrupts(); *(uint64_t*)&xs_state ^= e; __enable_interrupts(sr); } // STAK64: no LLD/SCD
+ }
+ 
+ int getentropy(void *buf, size_t len) {
+diff --git a/src/n64sys.c b/src/n64sys.c
+index 5e712ec..6f0f967 100644
+--- a/src/n64sys.c
++++ b/src/n64sys.c
+@@ -384,27 +384,37 @@ extern void* __mi_memset32(void *ptr, uint32_t value, size_t len);
+ extern void* __mi_memset64(void *ptr, uint64_t value, size_t len);
+ ///@endcond
+ 
++
++/* STAK64: software fallback for emulators without MI repeat mode. */
++static void *__sw_memset_pattern(void *ptr, uint64_t value, int width, size_t len)
++{
++    uint8_t *p = (uint8_t*)UncachedAddr(ptr);
++    for (size_t i = 0; i < len; i++)
++        p[i] = (uint8_t)(value >> (8 * (width - 1 - (i % width))));
++    return ptr;
++}
++
+ void* sys_hw_memset(void *ptr, uint8_t value, size_t len)
+ {
+-    assertf(!hw_memset_broken, "Your emulator is not accurate enough to run this ROM.\nSpecifically, it doesn't support MI repeat mode");
++    if (hw_memset_broken) return __sw_memset_pattern(ptr, (uint8_t)value, 1, len);
+     return __mi_memset(ptr, value, len);
+ }
+ 
+ void* sys_hw_memset16(void *ptr, uint16_t value, size_t len)
+ {
+-    assertf(!hw_memset_broken, "Your emulator is not accurate enough to run this ROM.\nSpecifically, it doesn't support MI repeat mode");
++    if (hw_memset_broken) return __sw_memset_pattern(ptr, value, 2, len);
+     return __mi_memset16(ptr, value, len);
+ }
+ 
+ void* sys_hw_memset32(void *ptr, uint32_t value, size_t len)
+ {
+-    assertf(!hw_memset_broken, "Your emulator is not accurate enough to run this ROM.\nSpecifically, it doesn't support MI repeat mode");
++    if (hw_memset_broken) return __sw_memset_pattern(ptr, value, 4, len);
+     return __mi_memset32(ptr, value, len);
+ }
+ 
+ void* sys_hw_memset64(void *ptr, uint64_t value, size_t len)
+ {
+-    assertf(!hw_memset_broken, "Your emulator is not accurate enough to run this ROM.\nSpecifically, it doesn't support MI repeat mode");
++    if (hw_memset_broken) return __sw_memset_pattern(ptr, value, 8, len);
+     return __mi_memset64(ptr, value, len);
+ }
+ 
+@@ -548,3 +558,4 @@ void __bss_check(void)
+ extern inline bool sys_bbplayer(void);
+ extern inline tv_type_t get_tv_type(void);
+ extern inline uint64_t get_system_ticks(void);
++
+diff --git a/src/rand.c b/src/rand.c
+index b3f9aca..16bef8b 100644
+--- a/src/rand.c
++++ b/src/rand.c
+@@ -1,3 +1,4 @@
++#include "interrupt_internal.h"
+ /**
+  * @file rand.c
+  * @author Giovanni Bajo <giovannibajo@gmail.com>
+@@ -16,17 +17,16 @@ uint64_t __xorshift64_mul_K = 0x2545F4914F6CDD1Dull;
+ 
+ __attribute__((noinline))
+ uint64_t __xorshift64(_Atomic uint64_t *state) {
+-    uint64_t old = atomic_load_explicit(state, memory_order_relaxed);
+-    while (1) {
+-        uint64_t x = old;
+-        x ^= x >> 12;
+-        x ^= x << 25;
+-        x ^= x >> 27;
+-        if (atomic_compare_exchange_weak_explicit(
+-                state, &old, x,
+-                memory_order_relaxed, memory_order_relaxed))  
+-            return x * __xorshift64_mul_K;
+-    }
++    // STAK64: avoid 64-bit LLD/SCD atomics (unsupported in mupen64plus).
++    uint32_t sr = __disable_interrupts();
++    uint64_t *st = (uint64_t*)state;
++    uint64_t x = *st;
++    x ^= x >> 12;
++    x ^= x << 25;
++    x ^= x >> 27;
++    *st = x;
++    __enable_interrupts(sr);
++    return x * __xorshift64_mul_K;
+ }
+ 
+ __attribute__((noinline))
